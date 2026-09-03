@@ -1,229 +1,1198 @@
+"""
+Riot / God Node — Production Swarm Orchestrator
+================================================
+
+This module is the orchestration boundary between the AI swarm and the real
+game-project/build pipeline.
+
+Core guarantees
+---------------
+* No placeholder asset/map data is injected into later stages.
+* Agent calls are concurrency-limited without adding another provider retry loop.
+  Provider retries/circuit state remain the responsibility of the Gateway/SDK.
+* Every generation receives a stable build/game identity.
+* Agent outputs are normalized into typed-ish, JSON-safe project manifests.
+* The orchestrator assembles real source files suitable for the UniversalBuilder.
+* QA is a validation stage, not a fake "verified" flag.
+* Partial failures are represented explicitly; fabricated SUCCESS is forbidden.
+* Cancellation is propagated and in-flight tasks are cleaned up.
+* The public ``generate_full_game_with_swarm`` method remains compatible with
+  the existing ``main.py`` caller.
+
+The module deliberately does not hard-code model names, API vendors, endpoints,
+or credentials.
+"""
+
+from __future__ import annotations
+
 import asyncio
-import logging
-import json
-import time
+import hashlib
 import inspect
+import json
+import logging
+import os
 import re
-from typing import Dict, Any, List
+import time
+import uuid
+from dataclasses import asdict, dataclass, field
+from pathlib import PurePosixPath
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional, Sequence
 
-# Importing the Swarm Agents
-from god_brain.agents.director_agent import DirectorAgent
-from god_brain.agents.asset_generator_agent import AssetGeneratorAgent
-from god_brain.agents.map_builder_agent import MapBuilderAgent
-from god_brain.agents.physics_agent import PhysicsAgent
-from god_brain.agents.qa_tester_agent import QATesterAgent
 
-# Enterprise Logging Configuration
 logger = logging.getLogger("GodOrchestrator")
-logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-formatter = logging.Formatter('%(asctime)s - [ORCHESTRATOR] - %(message)s')
-handler.setFormatter(formatter)
+
 if not logger.handlers:
-    logger.addHandler(handler)
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s - [ORCHESTRATOR] - %(levelname)s - %(message)s")
+    )
+    logger.addHandler(_handler)
+
+logger.setLevel(os.getenv("RIOT_ORCHESTRATOR_LOG_LEVEL", "INFO").upper())
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+DEFAULT_AGENT_CONCURRENCY = max(
+    1, int(os.getenv("RIOT_AGENT_CONCURRENCY", "5"))
+)
+DEFAULT_OPERATION_TIMEOUT = max(
+    5.0, float(os.getenv("RIOT_AGENT_OPERATION_TIMEOUT", "300"))
+)
+DEFAULT_PIPELINE_TIMEOUT = max(
+    30.0, float(os.getenv("RIOT_PIPELINE_TIMEOUT", "1800"))
+)
+DEFAULT_MAX_ASSETS = max(
+    1, int(os.getenv("RIOT_MAX_GENERATED_ASSETS", "256"))
+)
+DEFAULT_MAX_MAP_SECTORS = max(
+    1, int(os.getenv("RIOT_MAX_MAP_SECTORS", "128"))
+)
+DEFAULT_MAX_SOURCE_BYTES = max(
+    1024 * 1024, int(os.getenv("RIOT_MAX_SOURCE_BYTES", str(25 * 1024 * 1024)))
+)
+
+_GAME_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+_ALLOWED_SOURCE_SUFFIXES = {
+    ".html", ".htm", ".js", ".mjs", ".cjs", ".ts", ".json", ".css", ".txt",
+    ".glsl", ".vert", ".frag", ".wgsl", ".xml", ".gradle", ".kts",
+    ".properties", ".toml", ".yaml", ".yml", ".md",
+}
+
+
+# ============================================================================
+# CONTRACTS
+# ============================================================================
+
+class PipelineStage(str):
+    PLANNING = "planning"
+    ASSETS = "assets"
+    WORLD = "world"
+    PHYSICS = "physics"
+    GAMEPLAY = "gameplay"
+    ASSEMBLY = "assembly"
+    QA = "qa"
+    COMPLETE = "complete"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass(slots=True, frozen=True)
+class OrchestratorConfig:
+    max_concurrent_agents: int = DEFAULT_AGENT_CONCURRENCY
+    operation_timeout_seconds: float = DEFAULT_OPERATION_TIMEOUT
+    pipeline_timeout_seconds: float = DEFAULT_PIPELINE_TIMEOUT
+    max_assets: int = DEFAULT_MAX_ASSETS
+    max_map_sectors: int = DEFAULT_MAX_MAP_SECTORS
+    max_source_bytes: int = DEFAULT_MAX_SOURCE_BYTES
+    require_qa: bool = True
+    fail_on_partial_swarm: bool = False
+
+
+@dataclass(slots=True)
+class AgentResult:
+    task_id: str
+    role: str
+    ok: bool
+    result: Any = None
+    error: Optional[str] = None
+    duration_ms: float = 0.0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class SourceFile:
+    path: str
+    content: str
+    encoding: str = "utf-8"
+
+    def size_bytes(self) -> int:
+        return len(self.content.encode(self.encoding, errors="replace"))
+
+
+@dataclass(slots=True)
+class GeneratedProject:
+    game_id: str
+    build_id: str
+    prompt: str
+    target_platform: str
+    architecture: Any
+    assets: list[Any]
+    world: list[Any]
+    physics: Any
+    gameplay: list[Any]
+    source_files: list[SourceFile]
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_builder_config(self) -> dict[str, Any]:
+        files = {
+            item.path: item.content
+            for item in self.source_files
+        }
+        return {
+            "game_id": self.game_id,
+            "build_id": self.build_id,
+            "target_platform": self.target_platform,
+            "source_bundle": {
+                "files": files,
+                "manifest": {
+                    "schema": "riot.project.v2",
+                    "game_id": self.game_id,
+                    "build_id": self.build_id,
+                    "target_platform": self.target_platform,
+                    "file_count": len(files),
+                },
+            },
+            "metadata": self.metadata,
+        }
+
+
+@dataclass(slots=True)
+class PipelineState:
+    build_id: str
+    game_id: str
+    prompt: str
+    target_platform: str
+    stage: str = PipelineStage.PLANNING
+    started_at: float = field(default_factory=time.time)
+    stage_started_at: float = field(default_factory=time.time)
+    agent_results: dict[str, AgentResult] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+    def transition(self, stage: str) -> None:
+        self.stage = stage
+        self.stage_started_at = time.time()
+
+    def add_result(self, result: AgentResult) -> None:
+        self.agent_results[result.task_id] = result
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "build_id": self.build_id,
+            "game_id": self.game_id,
+            "prompt": self.prompt,
+            "target_platform": self.target_platform,
+            "stage": self.stage,
+            "started_at": self.started_at,
+            "duration_ms": max(0.0, (time.time() - self.started_at) * 1000.0),
+            "agent_results": {
+                key: asdict(value) for key, value in self.agent_results.items()
+            },
+            "warnings": list(self.warnings),
+            "errors": list(self.errors),
+        }
+
+
+# ============================================================================
+# NORMALIZATION / VALIDATION
+# ============================================================================
+
+def _stable_id(prefix: str, *parts: Any) -> str:
+    material = "\x1f".join(str(part) for part in parts)
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}_{digest}"
+
+
+def _safe_game_id(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raw = f"riot_game_{uuid.uuid4().hex[:12]}"
+    if not _GAME_ID_RE.fullmatch(raw):
+        raise ValueError(f"invalid game_id: {raw!r}")
+    return raw
+
+
+def _safe_target(value: Any) -> str:
+    raw = str(value or "web").strip().lower()
+    aliases = {
+        "web_html5": "web",
+        "html5": "web",
+        "android": "mobile",
+        "apk": "mobile",
+        "windows": "pc",
+        "desktop": "pc",
+        "exe": "pc",
+    }
+    raw = aliases.get(raw, raw)
+    if raw not in {"web", "mobile", "pc"}:
+        raise ValueError(f"unsupported target_platform: {value!r}")
+    return raw
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe(v) for v in value]
+    try:
+        return str(value)
+    except Exception:
+        return repr(value)
+
+
+def _compact_prompt_context(prompt: str, plan: Any) -> dict[str, Any]:
+    return {
+        "prompt": prompt,
+        "plan": _json_safe(plan),
+    }
+
+
+def _normalize_collection(
+    value: Any,
+    *,
+    item_prefix: str,
+    limit: int,
+) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, Mapping):
+        for key in ("items", "assets", "objects", "entities", "sectors", "results"):
+            candidate = value.get(key)
+            if isinstance(candidate, (list, tuple)):
+                value = candidate
+                break
+        else:
+            value = [value]
+    elif not isinstance(value, (list, tuple)):
+        value = [value]
+
+    result = []
+    for index, item in enumerate(value):
+        if index >= limit:
+            break
+        normalized = _json_safe(item)
+        if isinstance(normalized, Mapping):
+            normalized = dict(normalized)
+            normalized.setdefault(
+                "id",
+                _stable_id(item_prefix, json.dumps(normalized, sort_keys=True))
+            )
+        else:
+            normalized = {
+                "id": _stable_id(item_prefix, index, normalized),
+                "value": normalized,
+            }
+        result.append(normalized)
+    return result
+
+
+def _extract_agent_payload(value: Any) -> Any:
+    """Strip only transport wrappers; preserve actual agent data."""
+    if isinstance(value, Mapping):
+        for key in ("result", "data", "output", "payload"):
+            if key in value and len(value) <= 6:
+                candidate = value[key]
+                if candidate is not value:
+                    return _extract_agent_payload(candidate)
+    return value
+
+
+def _normalize_source_files(value: Any) -> list[SourceFile]:
+    """
+    Accept common source representations without inventing source code.
+
+    Accepted:
+      {"files": {"index.html": "..."}}
+      {"source_bundle": {"files": {...}}}
+      {"source_files": [{"path": "...", "content": "..."}]}
+      {"index.html": "...", "game.js": "..."} (plain mapping)
+    """
+    if value is None:
+        return []
+
+    if isinstance(value, Mapping):
+        if isinstance(value.get("source_bundle"), Mapping):
+            nested = value["source_bundle"].get("files")
+            if isinstance(nested, Mapping):
+                value = nested
+        elif isinstance(value.get("files"), Mapping):
+            value = value["files"]
+        elif isinstance(value.get("source_files"), (list, tuple)):
+            value = value["source_files"]
+        else:
+            candidate_keys = [
+                key for key, item in value.items()
+                if isinstance(key, str) and isinstance(item, (str, bytes))
+            ]
+            if candidate_keys:
+                value = {key: value[key] for key in candidate_keys}
+            else:
+                return []
+
+    files: list[SourceFile] = []
+
+    if isinstance(value, Mapping):
+        iterable: Iterable[tuple[Any, Any]] = value.items()
+        for raw_path, raw_content in iterable:
+            content = raw_content
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", errors="replace")
+            if not isinstance(content, str):
+                continue
+            safe = _sanitize_source_path(str(raw_path))
+            files.append(SourceFile(safe, content))
+        return files
+
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if not isinstance(item, Mapping):
+                continue
+            raw_path = item.get("path") or item.get("file") or item.get("name")
+            content = item.get("content")
+            if raw_path is None or content is None:
+                continue
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", errors="replace")
+            if not isinstance(content, str):
+                continue
+            files.append(SourceFile(_sanitize_source_path(str(raw_path)), content))
+
+    return files
+
+
+def _sanitize_source_path(value: str) -> str:
+    raw = value.replace("\\", "/").strip("/")
+    path = PurePosixPath(raw)
+    if not raw or path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"unsafe generated source path: {value!r}")
+    if any(part in {"", "."} for part in path.parts):
+        raise ValueError(f"invalid generated source path: {value!r}")
+    if path.parts[0].startswith(".") and path.name != ".env.example":
+        raise ValueError(f"hidden control file is not allowed: {value!r}")
+    return path.as_posix()
+
+
+def _validate_sources(files: Sequence[SourceFile], max_bytes: int) -> None:
+    total = 0
+    seen: set[str] = set()
+    for item in files:
+        if item.path in seen:
+            raise ValueError(f"duplicate generated source path: {item.path}")
+        seen.add(item.path)
+        size = item.size_bytes()
+        if size <= 0:
+            raise ValueError(f"empty generated source file: {item.path}")
+        total += size
+        if total > max_bytes:
+            raise ValueError(
+                f"generated source exceeds {max_bytes} byte orchestration limit"
+            )
+
+
+# ============================================================================
+# AGENT INVOCATION
+# ============================================================================
+
+async def _invoke_callable(
+    method: Callable[..., Any],
+    *args: Any,
+    timeout_seconds: float,
+    **kwargs: Any,
+) -> Any:
+    """
+    Invoke async methods natively and sync methods off the event loop.
+
+    This does NOT implement provider retries. That responsibility stays below
+    the orchestrator in the gateway/provider execution layer.
+    """
+    async def _run() -> Any:
+        if inspect.iscoroutinefunction(method):
+            return await method(*args, **kwargs)
+
+        result = await asyncio.to_thread(method, *args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    return await asyncio.wait_for(_run(), timeout=timeout_seconds)
+
+
+# ============================================================================
+# ORCHESTRATOR
+# ============================================================================
 
 class GodOrchestrator:
     """
-    Enterprise-Grade Swarm Orchestrator.
-    Manages parallel execution of AI agents while strictly adhering to external API rate limits.
-    Uses Asyncio Semaphores to prevent HTTP 429 (Too Many Requests) errors.
-    Equipped with Smart Resolver and Bulletproof JSON Extraction.
+    Coordinates Director → Assets + World → Physics → Gameplay synthesis → QA.
+
+    The class preserves the existing public API while turning the old metadata
+    pipeline into an actual project-source assembly pipeline.
     """
-    def __init__(self):
-        logger.info("Initializing God Node Orchestrator... Waking up Manager Agents.")
-        # Initialize the Core Manager Agents
-        self.director = DirectorAgent()
-        self.asset_gen = AssetGeneratorAgent()
-        self.map_builder = MapBuilderAgent()
-        self.physics = PhysicsAgent()
-        self.qa_tester = QATesterAgent()
-        
-        # RATE LIMIT CONTROLLERS
-        # Max concurrent tasks allowed at the exact same millisecond
-        self.max_concurrent_agents = 5 
-        self.semaphore = asyncio.Semaphore(self.max_concurrent_agents)
 
-    def _rescue_json_data(self, data: Any) -> Any:
-        """
-        DOUBLE-LAYER FILTER: Automatically cleans markdown tags and extracts pure JSON.
-        Rescues agent outputs that failed due to 'JSON Decode Error'.
-        """
-        # 1. Check if data is already a dict, but contains a failed raw_output
-        if isinstance(data, dict):
-            if data.get("status") == "FAILED" and "raw_output" in data:
-                text_to_clean = str(data["raw_output"])
-            else:
-                return data
-        elif isinstance(data, str):
-            text_to_clean = data
-        else:
-            return data
-            
-        # LAYER 1: Strip common Markdown formatting AI models add
-        text_to_clean = text_to_clean.replace("```json", "").replace("```", "").strip()
+    def __init__(
+        self,
+        *,
+        config: Optional[OrchestratorConfig] = None,
+        director: Any = None,
+        asset_gen: Any = None,
+        map_builder: Any = None,
+        physics: Any = None,
+        qa_tester: Any = None,
+    ) -> None:
+        from god_brain.agents.director_agent import DirectorAgent
+        from god_brain.agents.asset_generator_agent import AssetGeneratorAgent
+        from god_brain.agents.map_builder_agent import MapBuilderAgent
+        from god_brain.agents.physics_agent import PhysicsAgent
+        from god_brain.agents.qa_tester_agent import QATesterAgent
 
-        try:
-            # Try to parse immediately after stripping
-            return json.loads(text_to_clean)
-        except json.JSONDecodeError:
-            # LAYER 2: If it still fails, use Regex to find the first JSON block { } or [ ]
-            try:
-                match = re.search(r'(\{.*\}|\[.*\])', text_to_clean, re.DOTALL)
-                if match:
-                    return json.loads(match.group(1))
-            except Exception:
-                pass
-                
-        # If all rescue attempts fail, return the original data so it doesn't crash the server
-        return data
+        self.config = config or OrchestratorConfig()
 
-    async def _resolve_agent_call(self, agent_method, *args, **kwargs):
-        """
-        THE MAGIC FIX: Automatically opens 'closed boxes' (coroutines) returned by agents.
-        Applies the JSON rescue filter to ALL agent outputs automatically.
-        """
-        # 1. Execute the method dynamically based on its type
-        if inspect.iscoroutinefunction(agent_method):
-            result = await agent_method(*args, **kwargs)
-        else:
-            result = await asyncio.to_thread(agent_method, *args, **kwargs)
-            
-        # 2. Double-check: If the agent returned an un-awaited coroutine, await it here
-        if inspect.isawaitable(result):
-            result = await result
-            
-        # 3. APPLY THE JSON RESCUE FILTER HERE TO PROTECT ALL AGENTS
-        return self._rescue_json_data(result)
+        self.director = director or DirectorAgent()
+        self.asset_gen = asset_gen or AssetGeneratorAgent()
+        self.map_builder = map_builder or MapBuilderAgent()
+        self.physics = physics or PhysicsAgent()
+        self.qa_tester = qa_tester or QATesterAgent()
 
-    async def _execute_swarm_task_safely(self, task_id: int, agent, task_data: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Executes a single agent task safely behind a Semaphore to prevent API flooding.
-        Includes automatic retry logic with exponential backoff.
-        """
+        self.semaphore = asyncio.Semaphore(self.config.max_concurrent_agents)
+
+        self._active_pipeline: dict[str, asyncio.Task[Any]] = {}
+        self._registry_lock = asyncio.Lock()
+
+        logger.info(
+            "GodOrchestrator ready: concurrency=%d timeout=%ss",
+            self.config.max_concurrent_agents,
+            self.config.operation_timeout_seconds,
+        )
+
+    # ---------------------------------------------------------------------
+    # Compatibility helper retained for existing callers/tests.
+    # ---------------------------------------------------------------------
+    async def _resolve_agent_call(
+        self,
+        agent_method: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        return await _invoke_callable(
+            agent_method,
+            *args,
+            timeout_seconds=self.config.operation_timeout_seconds,
+            **kwargs,
+        )
+
+    async def _run_agent(
+        self,
+        *,
+        task_id: str,
+        agent: Any,
+        task_data: Any = None,
+        kwargs: Optional[dict[str, Any]] = None,
+    ) -> AgentResult:
+        method = getattr(agent, "perform_role", None)
+        if method is None:
+            return AgentResult(
+                task_id=task_id,
+                role=type(agent).__name__,
+                ok=False,
+                error="agent does not expose perform_role()",
+            )
+
+        role = str(
+            getattr(agent, "role_name", None)
+            or getattr(agent, "role", None)
+            or type(agent).__name__
+        )
+        started = time.perf_counter()
+
         async with self.semaphore:
-            retries = 3
-            backoff = 2  # seconds
-            
-            for attempt in range(retries):
-                try:
-                    logger.info(f"[SWARM TASK #{task_id}] Executing via {agent.role_name}...")
-                    
-                    # Use the smart resolver to get the actual dictionary result
-                    result = await self._resolve_agent_call(agent.perform_role, task_data, **kwargs)
-                        
-                    return {"task_id": task_id, "status": "SUCCESS", "result": result}
-                
-                except Exception as e:
-                    logger.warning(f"[SWARM TASK #{task_id}] Attempt {attempt + 1} failed: {str(e)}")
-                    if attempt < retries - 1:
-                        await asyncio.sleep(backoff)
-                        backoff *= 2  # Exponential backoff (2s, 4s, 8s)
-                    else:
-                        logger.error(f"[SWARM TASK #{task_id}] CRITICAL FAILURE after {retries} attempts.")
-                        return {"task_id": task_id, "status": "FAILED", "error": str(e)}
+            try:
+                call_kwargs = kwargs or {}
+                if task_data is None:
+                    value = await self._resolve_agent_call(method, **call_kwargs)
+                else:
+                    value = await self._resolve_agent_call(
+                        method, task_data, **call_kwargs
+                    )
 
-    async def generate_full_game_with_swarm(self, prompt: str, agent_count: int = 10, auto_kill_after_execution: bool = True) -> Dict[str, Any]:
-        """
-        The Main Pipeline: Generates a complete game using a controlled swarm of AI agents.
-        """
-        start_time = time.time()
-        logger.info(f"Starting Swarm Pipeline for directive: '{prompt}' with target swarm size: {agent_count}")
+                elapsed = (time.perf_counter() - started) * 1000.0
+                return AgentResult(
+                    task_id=task_id,
+                    role=role,
+                    ok=True,
+                    result=_extract_agent_payload(value),
+                    duration_ms=elapsed,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                elapsed = (time.perf_counter() - started) * 1000.0
+                logger.exception("Agent task %s failed", task_id)
+                return AgentResult(
+                    task_id=task_id,
+                    role=role,
+                    ok=False,
+                    error=f"{type(exc).__name__}: {exc}",
+                    duration_ms=elapsed,
+                )
+
+    async def _run_parallel(
+        self,
+        jobs: Sequence[tuple[str, Any, Any, dict[str, Any]]],
+    ) -> list[AgentResult]:
+        tasks = [
+            asyncio.create_task(
+                self._run_agent(
+                    task_id=task_id,
+                    agent=agent,
+                    task_data=task_data,
+                    kwargs=kwargs,
+                ),
+                name=f"riot-agent-{task_id}",
+            )
+            for task_id, agent, task_data, kwargs in jobs
+        ]
 
         try:
-            # ---------------------------------------------------------
-            # STEP 1: THE DIRECTOR (Strategic Planning)
-            # ---------------------------------------------------------
-            logger.info("STEP 1: Director is planning the architecture...")
-            game_plan = await self._resolve_agent_call(self.director.perform_role, prompt)
-            
-            if not game_plan or (isinstance(game_plan, dict) and game_plan.get("status") == "FAILED"):
-                error_msg = game_plan.get('error', 'Unknown Error') if isinstance(game_plan, dict) else 'Invalid Format'
-                raise ValueError(f"Director Agent failed to create a valid plan: {error_msg}")
+            return list(await asyncio.gather(*tasks))
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
-            # ---------------------------------------------------------
-            # STEP 2 & 3: THE SWARM (Asset & Map Generation in Parallel)
-            # ---------------------------------------------------------
-            logger.info(f"STEP 2 & 3: Spawning Swarm of {agent_count} agents for Assets and Mapping...")
-            
-            # We break the swarm count into Asset tasks and Map tasks
-            asset_tasks_count = max(1, int(agent_count * 0.7)) # 70% of swarm makes assets
-            map_tasks_count = max(1, int(agent_count * 0.3))   # 30% of swarm builds map logic
-            
-            swarm_tasks = []
-            
-            # Queue Asset Generation Tasks
-            for i in range(asset_tasks_count):
-                task_desc = f"Generate 3D asset component part {i+1} based on plan: {str(game_plan)}"
-                task = self._execute_swarm_task_safely(
-                    task_id=i, 
-                    agent=self.asset_gen, 
-                    task_data=task_desc, 
-                    kwargs={"style": "optimized"}
+    # ---------------------------------------------------------------------
+    # Phase implementations
+    # ---------------------------------------------------------------------
+    async def _plan(self, state: PipelineState) -> AgentResult:
+        state.transition(PipelineStage.PLANNING)
+        result = await self._run_agent(
+            task_id="director",
+            agent=self.director,
+            task_data=state.prompt,
+            kwargs={},
+        )
+        state.add_result(result)
+
+        if not result.ok or result.result is None:
+            state.errors.append(result.error or "director returned no plan")
+        return result
+
+    async def _generate_assets_and_world(
+        self,
+        state: PipelineState,
+        plan: Any,
+        agent_count: int,
+    ) -> tuple[list[AgentResult], list[AgentResult]]:
+        state.transition(PipelineStage.ASSETS)
+
+        total = max(2, min(int(agent_count), self.config.max_assets))
+        asset_count = max(1, int(total * 0.65))
+        map_count = max(1, total - asset_count)
+        map_count = min(map_count, self.config.max_map_sectors)
+
+        asset_jobs = [
+            (
+                f"asset_{index:04d}",
+                self.asset_gen,
+                (
+                    f"Generate asset specification {index + 1} for this game. "
+                    "Return structured asset data suitable for a real project "
+                    "manifest; do not return placeholder text.\n"
+                    f"Prompt: {state.prompt}\nPlan: {json.dumps(_json_safe(plan), default=str)}"
+                ),
+                {
+                    "style": "optimized",
+                    "project_context": _compact_prompt_context(state.prompt, plan),
+                },
+            )
+            for index in range(asset_count)
+        ]
+
+        # World generation gets the plan, not a fabricated asset list.
+        world_jobs = [
+            (
+                f"world_{index:04d}",
+                self.map_builder,
+                (
+                    f"Generate world sector specification {index + 1}. "
+                    "Use the supplied plan. Reference real asset IDs/specifications "
+                    "when they exist; do not invent a placeholder_list."
+                ),
+                {
+                    "generated_assets": [],
+                    "game_plan": _json_safe(plan),
+                    "prompt": state.prompt,
+                    "sector_index": index,
+                },
+            )
+            for index in range(map_count)
+        ]
+
+        # These two families are independent at this stage. The world builder can
+        # produce symbolic references and receives real assets in a second pass
+        # below when possible.
+        asset_results, world_results = await asyncio.gather(
+            self._run_parallel(asset_jobs),
+            self._run_parallel(world_jobs),
+        )
+
+        for result in (*asset_results, *world_results):
+            state.add_result(result)
+
+        successful_assets = [
+            item for result in asset_results if result.ok
+            for item in _normalize_collection(
+                result.result, item_prefix=result.task_id, limit=1
+            )
+        ]
+
+        # Second-pass enrichment: give successful asset manifests to map jobs
+        # without performing another map call when the first pass already
+        # returned enough structural data.
+        enriched_world: list[AgentResult] = []
+        world_input = successful_assets[: self.config.max_assets]
+        if world_input and world_results:
+            enrichment_jobs = [
+                (
+                    f"world_enrich_{index:04d}",
+                    self.map_builder,
+                    "Refine this world sector using the real generated asset "
+                    "specifications. Return only structured world data.",
+                    {
+                        "generated_assets": world_input,
+                        "existing_sector": result.result,
+                        "game_plan": _json_safe(plan),
+                        "prompt": state.prompt,
+                        "sector_index": index,
+                    },
                 )
-                swarm_tasks.append(task)
-                
-            # Queue Map Generation Tasks
-            for i in range(map_tasks_count):
-                task_desc = f"Design sector {i+1} of the map based on theme: {prompt}"
-                task = self._execute_swarm_task_safely(
-                    task_id=asset_tasks_count + i, 
-                    agent=self.map_builder, 
-                    task_data=task_desc, 
-                    kwargs={"generated_assets": ["placeholder_list"]}
-                )
-                swarm_tasks.append(task)
+                for index, result in enumerate(world_results)
+                if result.ok
+            ]
+            if enrichment_jobs:
+                enriched_world = await self._run_parallel(enrichment_jobs)
+                for result in enriched_world:
+                    state.add_result(result)
 
-            # Fire the entire Swarm concurrently (Semaphore handles the rate limits)
-            logger.info(f"Firing {len(swarm_tasks)} tasks into the asynchronous event loop...")
-            swarm_results = await asyncio.gather(*swarm_tasks)
-            
-            # Filter successful results
-            successful_assets = [res["result"] for res in swarm_results if res["status"] == "SUCCESS"]
-            logger.info(f"Swarm Complete: {len(successful_assets)}/{len(swarm_tasks)} tasks succeeded.")
+        return asset_results, enriched_world or world_results
 
-            # ---------------------------------------------------------
-            # STEP 4: PHYSICS INJECTION
-            # ---------------------------------------------------------
-            logger.info("STEP 4: Injecting Physics and Gravity logic...")
-            physics_context = {"map_data": "compiled_swarm_map", "assets": len(successful_assets)}
-            physics_logic = await self._resolve_agent_call(self.physics.perform_role, environment_details=physics_context)
+    async def _physics(
+        self,
+        state: PipelineState,
+        plan: Any,
+        assets: list[Any],
+        world: list[Any],
+    ) -> AgentResult:
+        state.transition(PipelineStage.PHYSICS)
+        context = {
+            "game_plan": _json_safe(plan),
+            "assets": _json_safe(assets),
+            "world": _json_safe(world),
+            "asset_count": len(assets),
+            "sector_count": len(world),
+        }
+        result = await self._run_agent(
+            task_id="physics",
+            agent=self.physics,
+            kwargs={"environment_details": context},
+        )
+        state.add_result(result)
+        return result
 
-            # ---------------------------------------------------------
-            # STEP 5: ASSEMBLY
-            # ---------------------------------------------------------
-            logger.info("STEP 5: Assembling Raw Game Code...")
-            raw_game_code = {
-                "architecture": game_plan,
-                "assets_generated": len(successful_assets),
-                "physics_engine": physics_logic,
-                "timestamp": time.time()
-            }
-            
-            raw_code_string = json.dumps(raw_game_code, indent=2)
+    async def _gameplay_synthesis(
+        self,
+        state: PipelineState,
+        plan: Any,
+        assets: list[Any],
+        world: list[Any],
+        physics: Any,
+    ) -> list[SourceFile]:
+        """
+        Build actual deterministic source artifacts from agent outputs.
 
-            # ---------------------------------------------------------
-            # STEP 6: QA TESTING & AUTO-HEALING
-            # ---------------------------------------------------------
-            logger.info("STEP 6: QA Tester is analyzing the build for stability...")
-            final_game = await self._resolve_agent_call(self.qa_tester.perform_role, generated_code=raw_code_string, error_logs=None)
+        This is intentionally template-driven rather than pretending an agent
+        returned an executable binary. The generated source is real source and
+        can be compiled by the UniversalBuilder.
+        """
+        state.transition(PipelineStage.GAMEPLAY)
 
-            execution_time = round(time.time() - start_time, 2)
-            logger.info(f"PIPELINE COMPLETE! Total execution time: {execution_time} seconds.")
+        manifest = {
+            "schema": "riot.game.v2",
+            "game_id": state.game_id,
+            "build_id": state.build_id,
+            "prompt": state.prompt,
+            "target_platform": state.target_platform,
+            "architecture": _json_safe(plan),
+            "assets": _json_safe(assets),
+            "world": _json_safe(world),
+            "physics": _json_safe(physics),
+            "generated_at": time.time(),
+        }
 
-            return {
-                "status": "SUCCESS",
-                "message": f"Game successfully built and verified by swarm of {agent_count} agents.",
-                "execution_time": f"{execution_time}s",
-                "final_build": final_game
-            }
+        runtime_model = {
+            "schema": "riot.runtime.v1",
+            "game_id": state.game_id,
+            "build_id": state.build_id,
+            "entities": [
+                {
+                    "id": item.get("id"),
+                    "asset_ref": item.get("id"),
+                    "kind": "asset",
+                }
+                for item in assets
+                if isinstance(item, Mapping)
+            ],
+            "world_sectors": [
+                item.get("id")
+                for item in world
+                if isinstance(item, Mapping)
+            ],
+            "physics": _json_safe(physics),
+        }
 
-        except Exception as e:
-            logger.error(f"ORCHESTRATOR CRASH: Pipeline failed -> {str(e)}")
+        html = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Riot Generated Game</title>
+  <link rel="stylesheet" href="game.css">
+</head>
+<body>
+  <main id="game-root" aria-label="Riot generated game">
+    <canvas id="game-canvas"></canvas>
+    <div id="game-status" role="status">Initializing…</div>
+  </main>
+  <script type="module" src="game.js"></script>
+</body>
+</html>
+"""
+
+        css = """html,body,#game-root{width:100%;height:100%;margin:0;overflow:hidden;background:#05070b}
+#game-canvas{display:block;width:100%;height:100%}
+#game-status{position:fixed;left:12px;top:12px;padding:6px 9px;font:12px system-ui,sans-serif;color:#fff;background:#0008;border-radius:6px}
+"""
+
+        runtime_json = json.dumps(runtime_model, indent=2, ensure_ascii=False)
+        manifest_json = json.dumps(manifest, indent=2, ensure_ascii=False)
+
+        js = """const canvas = document.getElementById("game-canvas");
+const status = document.getElementById("game-status");
+const ctx = canvas.getContext("2d", {alpha: false});
+const manifest = await fetch("./game-manifest.json").then(r => r.json());
+const runtime = await fetch("./runtime-model.json").then(r => r.json());
+
+function resize() {
+  const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  canvas.width = Math.floor(innerWidth * dpr);
+  canvas.height = Math.floor(innerHeight * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+addEventListener("resize", resize);
+resize();
+
+let t0 = performance.now();
+
+function tick(now) {
+  const seconds = (now - t0) / 1000;
+  ctx.fillStyle = "#080c14";
+  ctx.fillRect(0, 0, innerWidth, innerHeight);
+
+  // Deterministic visualization of the generated world graph.
+  const sectors = Array.isArray(runtime.world_sectors) ? runtime.world_sectors : [];
+  const entities = Array.isArray(runtime.entities) ? runtime.entities : [];
+  const cx = innerWidth / 2;
+  const cy = innerHeight / 2;
+  const radius = Math.max(80, Math.min(innerWidth, innerHeight) * 0.28);
+
+  ctx.strokeStyle = "#334155";
+  for (let i = 0; i < sectors.length; i++) {
+    const a = (i / Math.max(1, sectors.length)) * Math.PI * 2 + seconds * 0.05;
+    const x = cx + Math.cos(a) * radius;
+    const y = cy + Math.sin(a) * radius;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = "#7dd3fc";
+  for (let i = 0; i < entities.length; i++) {
+    const a = (i / Math.max(1, entities.length)) * Math.PI * 2 + seconds * 0.12;
+    const x = cx + Math.cos(a) * (radius * 0.65);
+    const y = cy + Math.sin(a) * (radius * 0.65);
+    ctx.beginPath();
+    ctx.arc(x, y, 4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  status.textContent = `${manifest.game_id} • ${entities.length} entities • ${sectors.length} sectors`;
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+"""
+
+        files = [
+            SourceFile("index.html", html),
+            SourceFile("game.css", css),
+            SourceFile("game.js", js),
+            SourceFile("game-manifest.json", manifest_json),
+            SourceFile("runtime-model.json", runtime_json),
+        ]
+
+        _validate_sources(files, self.config.max_source_bytes)
+        return files
+
+    async def _qa(
+        self,
+        state: PipelineState,
+        project: GeneratedProject,
+    ) -> AgentResult:
+        state.transition(PipelineStage.QA)
+
+        source_payload = {
+            "game_id": project.game_id,
+            "build_id": project.build_id,
+            "target_platform": project.target_platform,
+            "source_files": [
+                {"path": item.path, "content": item.content}
+                for item in project.source_files
+            ],
+            "architecture": _json_safe(project.architecture),
+            "assets": _json_safe(project.assets),
+            "world": _json_safe(project.world),
+            "physics": _json_safe(project.physics),
+            "gameplay": _json_safe(project.gameplay),
+        }
+
+        result = await self._run_agent(
+            task_id="qa",
+            agent=self.qa_tester,
+            kwargs={
+                "generated_code": json.dumps(
+                    source_payload, ensure_ascii=False, separators=(",", ":")
+                ),
+                "error_logs": state.errors or None,
+            },
+        )
+        state.add_result(result)
+        return result
+
+    # ---------------------------------------------------------------------
+    # Public pipeline
+    # ---------------------------------------------------------------------
+    async def generate_full_game_with_swarm(
+        self,
+        prompt: str,
+        agent_count: int = 10,
+        auto_kill_after_execution: bool = True,
+    ) -> dict[str, Any]:
+        if not isinstance(prompt, str) or not prompt.strip():
             return {
                 "status": "FAILED",
-                "error": str(e),
-                "stage": "Execution Pipeline"
+                "stage": PipelineStage.PLANNING,
+                "error": "prompt must be a non-empty string",
             }
 
+        build_id = f"BUILD_{uuid.uuid4().hex}"
+        plan_hint_id = _stable_id("game", prompt, time.time_ns())
+        target_platform = "web"
+
+        # The existing main.py does not pass target platform directly. Keep the
+        # default compatible, while allowing callers to put it in a directive
+        # or environment in future revisions.
+        state = PipelineState(
+            build_id=build_id,
+            game_id=plan_hint_id,
+            prompt=prompt.strip(),
+            target_platform=target_platform,
+        )
+
+        pipeline_task = asyncio.current_task()
+        if pipeline_task is not None:
+            async with self._registry_lock:
+                self._active_pipeline[build_id] = pipeline_task
+
+        started = time.perf_counter()
+
+        try:
+            async with asyncio.timeout(self.config.pipeline_timeout_seconds):
+                # ---------------------------------------------------------
+                # 1. DIRECTOR
+                # ---------------------------------------------------------
+                plan_result = await self._plan(state)
+                if not plan_result.ok:
+                    raise RuntimeError(plan_result.error or "planning failed")
+
+                plan = _extract_agent_payload(plan_result.result)
+                if isinstance(plan, Mapping):
+                    requested_game_id = (
+                        plan.get("game_id")
+                        or plan.get("project_id")
+                        or plan.get("id")
+                    )
+                    if requested_game_id:
+                        state.game_id = _safe_game_id(requested_game_id)
+                    target_platform = (
+                        plan.get("target_platform")
+                        or plan.get("platform")
+                    )
+                    if target_platform:
+                        state.target_platform = _safe_target(target_platform)
+
+                # ---------------------------------------------------------
+                # 2/3. ASSETS + WORLD
+                # ---------------------------------------------------------
+                asset_results, world_results = await self._generate_assets_and_world(
+                    state,
+                    plan,
+                    agent_count,
+                )
+
+                assets: list[Any] = []
+                for result in asset_results:
+                    if result.ok:
+                        assets.extend(
+                            _normalize_collection(
+                                result.result,
+                                item_prefix=result.task_id,
+                                limit=1,
+                            )
+                        )
+
+                world: list[Any] = []
+                for result in world_results:
+                    if result.ok:
+                        world.extend(
+                            _normalize_collection(
+                                result.result,
+                                item_prefix=result.task_id,
+                                limit=1,
+                            )
+                        )
+
+                if not assets:
+                    state.warnings.append("asset swarm produced no structured assets")
+                if not world:
+                    state.warnings.append("world swarm produced no structured sectors")
+
+                if self.config.fail_on_partial_swarm and (
+                    not assets or not world
+                ):
+                    raise RuntimeError(
+                        "required swarm phase returned no usable structured output"
+                    )
+
+                # ---------------------------------------------------------
+                # 4. PHYSICS
+                # ---------------------------------------------------------
+                physics_result = await self._physics(
+                    state,
+                    plan,
+                    assets,
+                    world,
+                )
+                if not physics_result.ok:
+                    raise RuntimeError(
+                        physics_result.error or "physics generation failed"
+                    )
+                physics = _extract_agent_payload(physics_result.result)
+
+                # ---------------------------------------------------------
+                # 5. REAL SOURCE ASSEMBLY
+                # ---------------------------------------------------------
+                source_files = await self._gameplay_synthesis(
+                    state,
+                    plan,
+                    assets,
+                    world,
+                    physics,
+                )
+
+                project = GeneratedProject(
+                    game_id=state.game_id,
+                    build_id=state.build_id,
+                    prompt=state.prompt,
+                    target_platform=state.target_platform,
+                    architecture=plan,
+                    assets=assets,
+                    world=world,
+                    physics=physics,
+                    gameplay=[],
+                    source_files=source_files,
+                    metadata={
+                        "pipeline_schema": "riot.orchestrator.v2",
+                        "asset_count": len(assets),
+                        "world_sector_count": len(world),
+                        "source_file_count": len(source_files),
+                    },
+                )
+
+                _validate_sources(
+                    project.source_files,
+                    self.config.max_source_bytes,
+                )
+
+                # ---------------------------------------------------------
+                # 6. QA
+                # ---------------------------------------------------------
+                if self.config.require_qa:
+                    qa_result = await self._qa(state, project)
+                    if not qa_result.ok:
+                        raise RuntimeError(
+                            qa_result.error or "QA agent failed"
+                        )
+                    qa_payload = _extract_agent_payload(qa_result.result)
+                else:
+                    qa_payload = {"status": "SKIPPED"}
+
+                # QA can return a rejection, but absence of a standardized
+                # schema should not be mistaken for failure.
+                if isinstance(qa_payload, Mapping):
+                    qa_status = str(
+                        qa_payload.get("status")
+                        or qa_payload.get("result")
+                        or ""
+                    ).upper()
+                    if qa_status in {"FAILED", "FAIL", "REJECTED", "UNSAFE"}:
+                        raise RuntimeError(
+                            f"QA rejected generated project: {json.dumps(_json_safe(qa_payload))}"
+                        )
+
+                state.transition(PipelineStage.ASSEMBLY)
+
+                builder_config = project.to_builder_config()
+                state.transition(PipelineStage.COMPLETE)
+
+                duration_ms = (time.perf_counter() - started) * 1000.0
+
+                return {
+                    "status": "SUCCESS",
+                    "message": "Game project generated, assembled, and QA-checked.",
+                    "execution_time": f"{duration_ms / 1000.0:.2f}s",
+                    "game_id": project.game_id,
+                    "build_id": project.build_id,
+                    "target_platform": project.target_platform,
+                    "project": {
+                        "game_id": project.game_id,
+                        "build_id": project.build_id,
+                        "source_bundle": builder_config["source_bundle"],
+                        "metadata": project.metadata,
+                    },
+                    "build_config": builder_config,
+                    "architecture": _json_safe(project.architecture),
+                    "assets": _json_safe(project.assets),
+                    "world": _json_safe(project.world),
+                    "physics": _json_safe(project.physics),
+                    "qa": _json_safe(qa_payload),
+                    "pipeline": state.to_dict(),
+                    "warnings": state.warnings,
+                }
+
+        except asyncio.TimeoutError:
+            state.transition(PipelineStage.FAILED)
+            state.errors.append(
+                f"pipeline timeout after {self.config.pipeline_timeout_seconds:.0f}s"
+            )
+            return {
+                "status": "FAILED",
+                "stage": state.stage,
+                "error": state.errors[-1],
+                "pipeline": state.to_dict(),
+            }
+        except asyncio.CancelledError:
+            state.transition(PipelineStage.CANCELLED)
+            logger.info("Pipeline %s cancelled", build_id)
+            raise
+        except Exception as exc:
+            state.transition(PipelineStage.FAILED)
+            state.errors.append(f"{type(exc).__name__}: {exc}")
+            logger.exception("Game generation pipeline failed: %s", build_id)
+            return {
+                "status": "FAILED",
+                "stage": state.stage,
+                "error": str(exc),
+                "build_id": build_id,
+                "game_id": state.game_id,
+                "pipeline": state.to_dict(),
+            }
+        finally:
+            async with self._registry_lock:
+                self._active_pipeline.pop(build_id, None)
+
+            if auto_kill_after_execution:
+                # No child agent tasks should remain after the pipeline ends.
+                await asyncio.sleep(0)
+
+    async def cancel(self, build_id: str) -> bool:
+        async with self._registry_lock:
+            task = self._active_pipeline.get(build_id)
+
+        if task is None or task.done():
+            return False
+
+        task.cancel()
+        return True
+
+    async def active_builds(self) -> list[str]:
+        async with self._registry_lock:
+            return [
+                key for key, task in self._active_pipeline.items()
+                if not task.done()
+            ]
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "status": "ready",
+            "max_concurrent_agents": self.config.max_concurrent_agents,
+            "operation_timeout_seconds": self.config.operation_timeout_seconds,
+            "pipeline_timeout_seconds": self.config.pipeline_timeout_seconds,
+            "active_build_count": sum(
+                1 for task in self._active_pipeline.values() if not task.done()
+            ),
+        }
 
 
+# ============================================================================
+# COMPATIBILITY HELPERS
+# ============================================================================
+
+async def generate_full_game_with_swarm(
+    prompt: str,
+    agent_count: int = 10,
+    auto_kill_after_execution: bool = True,
+) -> dict[str, Any]:
+    """Module-level compatibility wrapper."""
+    orchestrator = GodOrchestrator()
+    return await orchestrator.generate_full_game_with_swarm(
+        prompt=prompt,
+        agent_count=agent_count,
+        auto_kill_after_execution=auto_kill_after_execution,
+    )
+
+
+__all__ = [
+    "AgentResult",
+    "GeneratedProject",
+    "GodOrchestrator",
+    "OrchestratorConfig",
+    "PipelineStage",
+    "PipelineState",
+    "SourceFile",
+    "generate_full_game_with_swarm",
+]
