@@ -1,1489 +1,1022 @@
 """
-main.py
-Riot Control Plane
-=================
+Riot / God Node — Production Master Runtime
+============================================
 
-Application entrypoint for the Riot game-generation platform.
+Single-process control plane for the personal Riot game-generation engine.
 
-Step 1 goals:
-- Harden the public control plane.
-- Remove the insecure implicit master PIN.
-- Make task execution bounded and observable.
-- Keep blocking native/C++ work off the asyncio event loop.
-- Make startup/shutdown deterministic.
-- Preserve existing subsystem interfaces so deeper modules can be upgraded
-  independently in later steps.
+Pipeline:
+    HTTP/WebSocket
+        -> authentication
+        -> master intent router
+        -> GodOrchestrator
+        -> real source bundle
+        -> QA
+        -> UniversalBuilder
+        -> verified artifact
+        -> bounded task/project registries
+
+Design guarantees
+-----------------
+* No fake build source or dummy artifact path is generated here.
+* The advanced orchestrator is the canonical source of generated projects.
+* The UniversalBuilder receives the orchestrator's real ``source_bundle``.
+* Background work is explicitly tracked and cancelled on shutdown.
+* Task/project registries are bounded by TTL and entry count.
+* WebSocket endpoints require the same configured master credential.
+* CORS is configuration-driven and cannot silently enable wildcard credentials.
+* Sync subsystem calls are moved off the asyncio event loop correctly.
+* Existing public endpoints remain compatible with the previous main.py surface.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hmac
+import contextlib
+import inspect
 import logging
 import os
-import secrets
+import re
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from threading import RLock
-from typing import Any
+from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
 
-from fastapi import (
-    FastAPI,
-    Header,
-    HTTPException,
-    WebSocket,
-    WebSocketDisconnect,
-)
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field, field_validator
 
-# ============================================================================
-# LOGGING
-# ============================================================================
-
-LOG_LEVEL = os.getenv("GOD_LOG_LEVEL", "INFO").upper()
-
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format=(
-        "%(asctime)s | %(levelname)s | %(name)s | "
-        "%(message)s"
-    ),
-)
-
-logger = logging.getLogger("Riot.Main")
 
 # ============================================================================
 # RUNTIME CONFIGURATION
 # ============================================================================
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+logger = logging.getLogger("GodNode.Main")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s - [GOD NODE CORE] - %(levelname)s - %(message)s"
+        )
+    )
+    logger.addHandler(handler)
+logger.setLevel(os.getenv("RIOT_LOG_LEVEL", "INFO").upper())
 
-ENVIRONMENT = os.getenv("GOD_ENV", "development").strip().lower()
 
-ENGINE_TICK_HZ = max(
-    1,
-    min(
-        int(os.getenv("GOD_ENGINE_TICK_HZ", "60")),
-        240,
-    ),
-)
+_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 
-TASK_MAX_SIZE = max(
-    100,
-    int(os.getenv("GOD_MAX_TASKS", "10000")),
-)
 
-TASK_TTL_SECONDS = max(
-    60,
-    int(os.getenv("GOD_TASK_TTL", "3600")),
-)
+def _csv_env(name: str, default: str = "") -> list[str]:
+    raw = os.getenv(name, default)
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
-MAX_DIRECTIVE_LENGTH = max(
-    1024,
-    int(os.getenv("GOD_MAX_DIRECTIVE_LENGTH", "50000")),
-)
 
-MAX_CONTEXT_KEYS = max(
-    16,
-    int(os.getenv("GOD_MAX_CONTEXT_KEYS", "256")),
-)
+@dataclass(frozen=True, slots=True)
+class RuntimeConfig:
+    task_ttl_seconds: float = max(60.0, float(os.getenv("RIOT_TASK_TTL_SECONDS", "3600")))
+    max_task_entries: int = max(64, int(os.getenv("RIOT_MAX_TASK_ENTRIES", "2048")))
+    project_ttl_seconds: float = max(300.0, float(os.getenv("RIOT_PROJECT_TTL_SECONDS", "21600")))
+    max_project_entries: int = max(16, int(os.getenv("RIOT_MAX_PROJECT_ENTRIES", "128")))
+    max_concurrent_pipelines: int = max(1, int(os.getenv("RIOT_MAX_CONCURRENT_PIPELINES", "2")))
+    max_concurrent_builds: int = max(1, int(os.getenv("RIOT_MAX_CONCURRENT_BUILDS", "1")))
+    heartbeat_seconds: float = max(5.0, float(os.getenv("RIOT_WS_HEARTBEAT_SECONDS", "20")))
+    cors_origins: tuple[str, ...] = tuple(_csv_env("RIOT_CORS_ORIGINS"))
 
-ALLOWED_ORIGINS_RAW = os.getenv(
-    "GOD_CORS_ORIGINS",
-    "http://localhost:3000,http://localhost:5173",
-)
 
-ALLOWED_ORIGINS = [
-    origin.strip()
-    for origin in ALLOWED_ORIGINS_RAW.split(",")
-    if origin.strip()
-]
-
-# ============================================================================
-# SECURITY
-# ============================================================================
-
-# There is deliberately NO fallback password.
-#
-# Production and staging require GOD_MASTER_PIN.
-#
-# Development may opt into an ephemeral generated secret by setting:
-#
-#   GOD_ALLOW_EPHEMERAL_DEV_SECRET=true
-#
-# The generated secret is printed once to the local log because otherwise a
-# local developer would have no way to authenticate. This mode must never be
-# used in production.
-#
+CONFIG = RuntimeConfig()
 MASTER_PIN = os.getenv("GOD_MASTER_PIN", "").strip()
-
-ALLOW_EPHEMERAL_DEV_SECRET = (
-    os.getenv(
-        "GOD_ALLOW_EPHEMERAL_DEV_SECRET",
-        "false",
-    ).strip().lower()
-    == "true"
-)
-
 if not MASTER_PIN:
-    if ENVIRONMENT in {"development", "dev"} and ALLOW_EPHEMERAL_DEV_SECRET:
-        MASTER_PIN = secrets.token_urlsafe(24)
-        logger.warning(
-            "Development mode is using an ephemeral administrative secret. "
-            "Set GOD_MASTER_PIN for persistent authentication."
-        )
-        logger.warning("Ephemeral GOD_MASTER_PIN: %s", MASTER_PIN)
-    else:
-        raise RuntimeError(
-            "GOD_MASTER_PIN is required. "
-            "Refusing to start without an administrator secret. "
-            "For local development only, set "
-            "GOD_ALLOW_EPHEMERAL_DEV_SECRET=true."
-        )
-
-# Never permit an obviously weak administrative secret.
-if len(MASTER_PIN) < 12:
-    raise RuntimeError(
-        "GOD_MASTER_PIN must contain at least 12 characters."
+    logger.warning(
+        "GOD_MASTER_PIN is not configured; protected API/WebSocket operations will be unavailable."
     )
-
-
-def _authorize(
-    provided_secret: str | None,
-    *,
-    header_secret: str | None = None,
-) -> None:
-    """
-    Constant-time authorization check.
-
-    Header authentication is preferred because it avoids repeatedly placing
-    the administrative secret into request JSON bodies. The legacy body value
-    remains supported for compatibility with the current UI.
-    """
-
-    candidate = (
-        header_secret.strip()
-        if header_secret
-        else (provided_secret or "").strip()
-    )
-
-    if not candidate or not hmac.compare_digest(candidate, MASTER_PIN):
-        raise HTTPException(
-            status_code=403,
-            detail="ACCESS DENIED",
-        )
 
 
 # ============================================================================
-# COMPONENT REGISTRY
+# GLOBAL STATE / REGISTRIES
 # ============================================================================
 
 SYSTEM_REGISTRY: dict[str, Any] = {}
-BOOT_FAILURES: dict[str, str] = {}
+
+# In-memory project registry is intentionally bounded. The generated source bundle
+# is retained so /api/v2/export can build the exact project returned by orchestration.
+_generated_projects: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_project_lock = asyncio.Lock()
+
+# Task registry is a bounded control-plane cache, not an unbounded history database.
+_active_tasks: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_task_lock = asyncio.Lock()
+
+# Every long-running background task gets explicitly tracked for graceful shutdown.
+_runtime_tasks: set[asyncio.Task[Any]] = set()
+_runtime_task_lock = asyncio.Lock()
+
+_pipeline_semaphore = asyncio.Semaphore(CONFIG.max_concurrent_pipelines)
+_build_semaphore = asyncio.Semaphore(CONFIG.max_concurrent_builds)
 
 
-def _register_component(
-    name: str,
-    factory: Any,
+# ============================================================================
+# SAFE ASYNC DISPATCH
+# ============================================================================
+
+async def call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Invoke async callables natively and sync callables in a worker thread."""
+    if inspect.iscoroutinefunction(fn):
+        return await fn(*args, **kwargs)
+
+    result = await asyncio.to_thread(fn, *args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+# ============================================================================
+# TASK / PROJECT REGISTRY
+# ============================================================================
+
+async def _purge_expired_locked(
+    registry: "OrderedDict[str, dict[str, Any]]",
     *,
-    critical: bool = False,
+    ttl_seconds: float,
 ) -> None:
-    """
-    Register one Riot subsystem without bringing down optional components.
-    """
-
-    try:
-        SYSTEM_REGISTRY[name] = factory()
-        logger.info("Subsystem online: %s", name)
-    except Exception as exc:
-        BOOT_FAILURES[name] = str(exc)
-
-        if critical:
-            logger.critical(
-                "Critical subsystem failed: %s | %s",
-                name,
-                exc,
-            )
-        else:
-            logger.warning(
-                "Optional subsystem failed: %s | %s",
-                name,
-                exc,
-            )
-
-
-# ============================================================================
-# SUBSYSTEM BOOTSTRAP
-# ============================================================================
-
-def bootstrap_subsystems() -> None:
-    """
-    Construct existing Riot services.
-
-    This first-stage refactor keeps the current interfaces intact. A later
-    step will move this into a dedicated dependency container.
-    """
-
-    # ------------------------------------------------------------------
-    # Security
-    # ------------------------------------------------------------------
-
-    try:
-        from security_vault.encryption import GodAuth
-
-        SYSTEM_REGISTRY["vault"] = GodAuth()
-
-        logger.info("Security vault online.")
-    except Exception as exc:
-        BOOT_FAILURES["vault"] = str(exc)
-        logger.critical("Security vault failed: %s", exc)
-
-    # ------------------------------------------------------------------
-    # Economy
-    # ------------------------------------------------------------------
-
-    try:
-        from economy_vault.billing_core import GodEconomyEngine
-
-        SYSTEM_REGISTRY["economy"] = GodEconomyEngine()
-
-        logger.info("Economy engine online.")
-    except Exception as exc:
-        BOOT_FAILURES["economy"] = str(exc)
-        logger.warning("Economy engine unavailable: %s", exc)
-
-    # ------------------------------------------------------------------
-    # Storage
-    # ------------------------------------------------------------------
-
-    try:
-        from cloud_storage.db_manager import db_vault
-
-        SYSTEM_REGISTRY["db_cloud"] = db_vault
-
-        logger.info("Storage layer online.")
-    except Exception as exc:
-        BOOT_FAILURES["db_cloud"] = str(exc)
-        logger.warning("Storage layer unavailable: %s", exc)
-
-    # ------------------------------------------------------------------
-    # Shared HTTP
-    # ------------------------------------------------------------------
-
-    try:
-        from god_brain.connection_pool import HTTP_CLIENT
-
-        SYSTEM_REGISTRY["connection_pool"] = HTTP_CLIENT
-
-        logger.info("HTTP connection pool online.")
-    except Exception as exc:
-        BOOT_FAILURES["connection_pool"] = str(exc)
-        logger.critical(
-            "HTTP connection pool failed: %s",
-            exc,
-        )
-
-    # ------------------------------------------------------------------
-    # AI gateway
-    # ------------------------------------------------------------------
-
-    try:
-        from core.gateway import GatewayRouter
-
-        gateway = GatewayRouter()
-
-        SYSTEM_REGISTRY["gateway"] = gateway
-
-        logger.info("AI gateway online.")
-    except Exception as exc:
-        BOOT_FAILURES["gateway"] = str(exc)
-        logger.critical("AI gateway failed: %s", exc)
-
-    # ------------------------------------------------------------------
-    # Master intent router
-    # ------------------------------------------------------------------
-
-    try:
-        from the_god_router.intent_classifier import (
-            master_router_instance,
-        )
-
-        SYSTEM_REGISTRY["master_router"] = master_router_instance
-
-        logger.info("Intent router online.")
-    except Exception as exc:
-        BOOT_FAILURES["master_router"] = str(exc)
-        logger.critical(
-            "Intent router failed: %s",
-            exc,
-        )
-
-    # ------------------------------------------------------------------
-    # AI orchestrator
-    # ------------------------------------------------------------------
-
-    try:
-        from god_brain.orchestrator import GodOrchestrator
-
-        SYSTEM_REGISTRY["orchestrator"] = GodOrchestrator()
-
-        logger.info("AI orchestrator online.")
-    except Exception as exc:
-        BOOT_FAILURES["orchestrator"] = str(exc)
-        logger.critical(
-            "AI orchestrator failed: %s",
-            exc,
-        )
-
-    # ------------------------------------------------------------------
-    # Simulation / multiplayer
-    # ------------------------------------------------------------------
-
-    try:
-        from simulation_scheduler.config import SchedulerConfig
-        from simulation_scheduler.scheduler import SimulationScheduler
-        from core_engine.cpp_bridge import SimulationCPPAdapter
-        from multiplayer_nexus.sync_server import init_nexus
-
-        engine_config = SchedulerConfig()
-
-        scheduler = SimulationScheduler(
-            engine_config,
-        )
-
-        cpp_bridge = SimulationCPPAdapter(
-            workspace_dir=str(
-                PROJECT_ROOT / "workspace_cpp",
-            ),
-        )
-
-        nexus = init_nexus(
-            scheduler,
-        )
-
-        SYSTEM_REGISTRY["scheduler"] = scheduler
-        SYSTEM_REGISTRY["cpp_bridge"] = cpp_bridge
-        SYSTEM_REGISTRY["nexus"] = nexus
-
-        logger.info(
-            "Simulation and multiplayer runtime online."
-        )
-
-    except Exception as exc:
-        BOOT_FAILURES["simulation"] = str(exc)
-        logger.critical(
-            "Simulation subsystem failed: %s",
-            exc,
-        )
-
-    # ------------------------------------------------------------------
-    # ODRE
-    # ------------------------------------------------------------------
-
-    try:
-        from core_engine.odre_core import reality_core
-
-        SYSTEM_REGISTRY["odre_engine"] = reality_core
-
-        logger.info("ODRE subsystem online.")
-    except Exception as exc:
-        BOOT_FAILURES["odre_engine"] = str(exc)
-        logger.warning(
-            "ODRE subsystem unavailable: %s",
-            exc,
-        )
-
-    # ------------------------------------------------------------------
-    # Procedural world builder
-    # ------------------------------------------------------------------
-
-    try:
-        from assets_factory.world_builder import world_forge
-
-        SYSTEM_REGISTRY["world_forge"] = world_forge
-
-        logger.info("World builder online.")
-    except Exception as exc:
-        BOOT_FAILURES["world_forge"] = str(exc)
-        logger.warning(
-            "World builder unavailable: %s",
-            exc,
-        )
-
-    # ------------------------------------------------------------------
-    # Pixel streaming
-    # ------------------------------------------------------------------
-
-    try:
-        from pixel_streaming.stream_manager import PixelStreamEngine
-
-        SYSTEM_REGISTRY["pixel_stream"] = PixelStreamEngine()
-
-        logger.info("Pixel streaming subsystem online.")
-    except Exception as exc:
-        BOOT_FAILURES["pixel_stream"] = str(exc)
-        logger.warning(
-            "Pixel streaming unavailable: %s",
-            exc,
-        )
-
-    # ------------------------------------------------------------------
-    # Live editor
-    # ------------------------------------------------------------------
-
-    try:
-        from live_editor.hot_reloader import vibe_coder_engine
-
-        SYSTEM_REGISTRY["hot_reloader"] = vibe_coder_engine
-
-        logger.info("Live editor subsystem online.")
-    except Exception as exc:
-        BOOT_FAILURES["hot_reloader"] = str(exc)
-        logger.warning(
-            "Live editor unavailable: %s",
-            exc,
-        )
-
-    # ------------------------------------------------------------------
-    # Compiler
-    # ------------------------------------------------------------------
-
-    try:
-        from game_compilers.universal_builder import game_builder
-
-        SYSTEM_REGISTRY["builder"] = game_builder
-
-        logger.info("Game builder online.")
-    except Exception as exc:
-        BOOT_FAILURES["builder"] = str(exc)
-        logger.warning(
-            "Game builder unavailable: %s",
-            exc,
-        )
-
-    # ------------------------------------------------------------------
-    # Self evolution
-    # ------------------------------------------------------------------
-
-    try:
-        from god_brain.self_evolution import EvolutionEngine
-
-        SYSTEM_REGISTRY["evolution"] = EvolutionEngine()
-
-        logger.info("Self-evolution subsystem online.")
-    except Exception as exc:
-        BOOT_FAILURES["evolution"] = str(exc)
-        logger.warning(
-            "Self-evolution unavailable: %s",
-            exc,
-        )
-
-
-# Bootstrap once during module import to preserve the current application's
-# public interfaces. The next architecture step will replace this with a
-# proper application container and dependency-injection lifecycle.
-bootstrap_subsystems()
-
-# ============================================================================
-# TASK STORE
-# ============================================================================
-
-
-class TaskStore:
-    """
-    Bounded in-memory task state.
-
-    This is intentionally still process-local for Step 1. It prevents the
-    current unbounded dictionary from growing forever and gives us TTL/eviction
-    semantics. A distributed job store will replace it later.
-    """
-
-    def __init__(
-        self,
-        *,
-        max_size: int,
-        ttl_seconds: int,
-    ) -> None:
-        self.max_size = max_size
-        self.ttl_seconds = ttl_seconds
-
-        self._tasks: dict[str, dict[str, Any]] = {}
-        self._updated_at: dict[str, float] = {}
-        self._lock = RLock()
-
-    def _cleanup_locked(self) -> None:
-        now = time.monotonic()
-
-        expired = [
-            task_id
-            for task_id, updated_at in self._updated_at.items()
-            if now - updated_at > self.ttl_seconds
-        ]
-
-        for task_id in expired:
-            self._tasks.pop(task_id, None)
-            self._updated_at.pop(task_id, None)
-
-        overflow = len(self._tasks) - self.max_size
-
-        if overflow > 0:
-            oldest = sorted(
-                self._updated_at.items(),
-                key=lambda item: item[1],
-            )[:overflow]
-
-            for task_id, _ in oldest:
-                self._tasks.pop(task_id, None)
-                self._updated_at.pop(task_id, None)
-
-    def create(self, task_id: str) -> None:
-        with self._lock:
-            self._cleanup_locked()
-
-            now = time.monotonic()
-
-            self._tasks[task_id] = {
+    now = time.time()
+    expired = [
+        key
+        for key, value in registry.items()
+        if now - float(value.get("updated_at", value.get("created_at", now))) > ttl_seconds
+    ]
+    for key in expired:
+        registry.pop(key, None)
+
+
+async def _ensure_task_capacity_locked() -> None:
+    await _purge_expired_locked(_active_tasks, ttl_seconds=CONFIG.task_ttl_seconds)
+    while len(_active_tasks) >= CONFIG.max_task_entries:
+        _active_tasks.popitem(last=False)
+
+
+async def _set_task(
+    task_id: str,
+    *,
+    status: str,
+    progress: int,
+    result: Any = None,
+    error: Optional[str] = None,
+    kind: str = "pipeline",
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> None:
+    async with _task_lock:
+        current = _active_tasks.get(task_id)
+        if current is None:
+            await _ensure_task_capacity_locked()
+            current = {
                 "task_id": task_id,
-                "status": "QUEUED",
-                "progress": 0,
-                "result": None,
+                "kind": kind,
                 "created_at": time.time(),
-                "updated_at": time.time(),
             }
-
-            self._updated_at[task_id] = now
-
-    def update(
-        self,
-        task_id: str,
-        **changes: Any,
-    ) -> None:
-        with self._lock:
-            task = self._tasks.get(task_id)
-
-            if task is None:
-                return
-
-            task.update(changes)
-
-            now = time.time()
-
-            task["updated_at"] = now
-            self._updated_at[task_id] = time.monotonic()
-
-            self._cleanup_locked()
-
-    def get(self, task_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            self._cleanup_locked()
-
-            task = self._tasks.get(task_id)
-
-            if task is None:
-                return None
-
-            return dict(task)
-
-
-TASKS = TaskStore(
-    max_size=TASK_MAX_SIZE,
-    ttl_seconds=TASK_TTL_SECONDS,
-)
-
-RUNNING_TASKS: dict[str, asyncio.Task[Any]] = {}
-
-# ============================================================================
-# REQUEST SCHEMAS
-# ============================================================================
-
-
-class SecurePayload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-
-class GodCommandPayload(SecurePayload):
-    directive: str = Field(
-        ...,
-        min_length=1,
-        max_length=MAX_DIRECTIVE_LENGTH,
-    )
-
-    # Legacy compatibility field.
-    # Header authentication is preferred.
-    master_pin: str | None = Field(
-        default=None,
-        max_length=256,
-    )
-
-    context_data: dict[str, Any] = Field(
-        default_factory=dict,
-        max_length=MAX_CONTEXT_KEYS,
-    )
-
-
-class BuildExportPayload(SecurePayload):
-    game_id: str = Field(
-        ...,
-        min_length=1,
-        max_length=256,
-    )
-
-    target_platform: str = Field(
-        pattern="^(web|mobile|pc)$",
-    )
-
-    master_pin: str | None = Field(
-        default=None,
-        max_length=256,
-    )
-
-
-class WebRTCOfferPayload(SecurePayload):
-    player_id: str = Field(
-        ...,
-        min_length=1,
-        max_length=128,
-    )
-
-    sdp: str = Field(
-        ...,
-        min_length=1,
-        max_length=500_000,
-    )
-
-    type: str = Field(
-        ...,
-        min_length=1,
-        max_length=32,
-    )
-
-
-# ============================================================================
-# ASYNC TASK EXECUTION
-# ============================================================================
-
-
-async def process_god_command_task(
-    task_id: str,
-    directive: str,
-    context_data: dict[str, Any] | None = None,
-) -> None:
-    """
-    Full generation pipeline.
-
-    The current underlying orchestrator interface is preserved.
-    """
-
-    TASKS.update(
-        task_id,
-        status="ANALYZING",
-        progress=10,
-    )
-
-    router = SYSTEM_REGISTRY.get("master_router")
-    orchestrator = SYSTEM_REGISTRY.get("orchestrator")
-
-    try:
-        if router is None:
-            raise RuntimeError(
-                "Master intent router is unavailable."
-            )
-
-        routing_plan = await router.analyze_and_allocate(
-            directive,
+        current.update(
+            {
+                "status": status,
+                "progress": max(0, min(100, int(progress))),
+                "updated_at": time.time(),
+                "result": result,
+                "error": error,
+            }
         )
-
-        TASKS.update(
-            task_id,
-            status="ORCHESTRATING_SWARM",
-            progress=30,
-        )
-
-        if orchestrator is None:
-            raise RuntimeError(
-                "AI orchestrator is unavailable."
-            )
-
-        architecture = routing_plan.get(
-            "architecture",
-            {},
-        )
-
-        target_platform = architecture.get(
-            "target_platform",
-            "web_html5",
-        )
-
-        agent_count = (
-            10
-            if target_platform != "web_html5"
-            else 5
-        )
-
-        swarm_result = (
-            await orchestrator.generate_full_game_with_swarm(
-                prompt=directive,
-                agent_count=agent_count,
-            )
-        )
-
-        TASKS.update(
-            task_id,
-            progress=90,
-        )
-
-        if swarm_result.get("status") == "FAILED":
-            raise RuntimeError(
-                swarm_result.get(
-                    "error",
-                    "Swarm execution failed.",
-                )
-            )
-
-        TASKS.update(
-            task_id,
-            status="SUCCESS",
-            progress=100,
-            result={
-                "routing_plan": routing_plan,
-                "final_build": swarm_result.get(
-                    "final_build",
-                ),
-                "context_keys": sorted(
-                    (context_data or {}).keys()
-                ),
-            },
-        )
-
-    except asyncio.CancelledError:
-        TASKS.update(
-            task_id,
-            status="CANCELLED",
-            progress=0,
-        )
-        raise
-
-    except Exception:
-        logger.exception(
-            "Generation task failed: %s",
-            task_id,
-        )
-
-        TASKS.update(
-            task_id,
-            status="FAILED",
-            result={
-                "error": (
-                    "Generation pipeline failed. "
-                    "Check server logs using the task ID."
-                )
-            },
-        )
+        if metadata:
+            current["metadata"] = dict(metadata)
+        _active_tasks[task_id] = current
+        _active_tasks.move_to_end(task_id)
 
 
-def _task_done_callback(
-    task_id: str,
-) -> Any:
-    def _callback(
-        task: asyncio.Task[Any],
-    ) -> None:
-        RUNNING_TASKS.pop(
-            task_id,
-            None,
-        )
+async def _get_task(task_id: str) -> Optional[dict[str, Any]]:
+    async with _task_lock:
+        await _purge_expired_locked(_active_tasks, ttl_seconds=CONFIG.task_ttl_seconds)
+        value = _active_tasks.get(task_id)
+        return dict(value) if value else None
 
+
+async def _store_project(project: Mapping[str, Any]) -> None:
+    game_id = str(project.get("game_id") or "").strip()
+    build_id = str(project.get("build_id") or "").strip()
+    if not _ID_RE.fullmatch(game_id) or not _ID_RE.fullmatch(build_id):
+        raise ValueError("invalid generated project identity")
+
+    record = {
+        "game_id": game_id,
+        "build_id": build_id,
+        "stored_at": time.time(),
+        "updated_at": time.time(),
+        "build_config": dict(project.get("build_config") or {}),
+        "pipeline": project.get("pipeline"),
+        "qa": project.get("qa"),
+        "target_platform": project.get("target_platform"),
+        "metadata": project.get("project", {}).get("metadata", {})
+        if isinstance(project.get("project"), Mapping)
+        else {},
+    }
+
+    async with _project_lock:
+        await _purge_expired_locked(_generated_projects, ttl_seconds=CONFIG.project_ttl_seconds)
+        while len(_generated_projects) >= CONFIG.max_project_entries:
+            _generated_projects.popitem(last=False)
+        _generated_projects[game_id] = record
+        _generated_projects.move_to_end(game_id)
+        # build_id is an alias to the same bounded record by storing the alias only
+        # when it is not already occupied. This keeps the registry game-keyed and bounded.
+        if build_id != game_id:
+            _generated_projects[build_id] = record
+            _generated_projects.move_to_end(build_id)
+            while len(_generated_projects) > CONFIG.max_project_entries:
+                _generated_projects.popitem(last=False)
+
+
+def _validate_identity(value: str, name: str) -> str:
+    value = str(value or "").strip()
+    if not _ID_RE.fullmatch(value):
+        raise HTTPException(status_code=400, detail=f"Invalid {name}")
+    return value
+
+
+async def _get_project(identity: str) -> Optional[dict[str, Any]]:
+    async with _project_lock:
+        await _purge_expired_locked(_generated_projects, ttl_seconds=CONFIG.project_ttl_seconds)
+        record = _generated_projects.get(identity)
+        return dict(record) if record else None
+
+
+async def _track_runtime_task(task: asyncio.Task[Any]) -> None:
+    async with _runtime_task_lock:
+        _runtime_tasks.add(task)
+
+    def _done(completed: asyncio.Task[Any]) -> None:
         try:
-            task.result()
-        except asyncio.CancelledError:
-            return
+            _runtime_tasks.discard(completed)
         except Exception:
-            logger.exception(
-                "Unhandled background task failure: %s",
-                task_id,
-            )
+            pass
 
-    return _callback
+    task.add_done_callback(_done)
+
+
+async def _spawn(coro: Awaitable[Any], *, name: str) -> asyncio.Task[Any]:
+    task = asyncio.create_task(coro, name=name)
+    await _track_runtime_task(task)
+    return task
 
 
 # ============================================================================
-# ENGINE LOOP
+# MODULE BOOTSTRAP
 # ============================================================================
 
+# Security & economy
+try:
+    from security_vault.encryption import GodAuth
+    SYSTEM_REGISTRY["vault"] = GodAuth()
+    logger.info("Security Vault ONLINE")
+except Exception as exc:
+    logger.critical("Security Vault failed: %s", exc)
+
+try:
+    from economy_vault.billing_core import GodEconomyEngine
+    SYSTEM_REGISTRY["economy"] = GodEconomyEngine()
+    logger.info("Economy Engine ONLINE")
+except Exception as exc:
+    logger.warning("Economy Engine unavailable: %s", exc)
+
+# Cloud / database
+try:
+    from cloud_storage.db_manager import db_vault
+    SYSTEM_REGISTRY["db_cloud"] = db_vault
+    logger.info("Cloud Database ONLINE")
+except Exception as exc:
+    logger.warning("Cloud DB unavailable: %s", exc)
+
+# Connection pool
+try:
+    from god_brain.connection_pool import HTTP_CLIENT
+    SYSTEM_REGISTRY["connection_pool"] = HTTP_CLIENT
+    logger.info("HTTP Connection Pool ONLINE")
+except Exception as exc:
+    logger.critical("HTTP Connection Pool failed: %s", exc)
+
+# Dynamic gateway
+try:
+    from core.gateway import GatewayRouter
+    gateway_instance = GatewayRouter()
+    SYSTEM_REGISTRY["gateway"] = gateway_instance
+    logger.info("Dynamic API Gateway ONLINE")
+except Exception as exc:
+    logger.critical("API Gateway failed: %s", exc)
+
+# Master intent router
+try:
+    from the_god_router.intent_classifier import master_router_instance
+    SYSTEM_REGISTRY["master_router"] = master_router_instance
+    logger.info("Master Intent Router ONLINE")
+except Exception as exc:
+    logger.critical("Master Router failed: %s", exc)
+
+# Advanced orchestrator — this is the canonical generation boundary.
+try:
+    from god_brain.orchestrator import GodOrchestrator
+    SYSTEM_REGISTRY["orchestrator"] = GodOrchestrator()
+    logger.info("Advanced God Orchestrator ONLINE")
+except Exception as exc:
+    logger.critical("God Orchestrator failed: %s", exc)
+
+# Runtime engine
+try:
+    from simulation_scheduler.config import SchedulerConfig
+    from simulation_scheduler.scheduler import SimulationScheduler
+    from core_engine.cpp_bridge import SimulationCPPAdapter
+    from multiplayer_nexus.sync_server import init_nexus
+
+    scheduler = SimulationScheduler(SchedulerConfig())
+    SYSTEM_REGISTRY["scheduler"] = scheduler
+
+    cpp_adapter = SimulationCPPAdapter(workspace_dir="workspace_cpp")
+    SYSTEM_REGISTRY["cpp_bridge"] = cpp_adapter
+
+    SYSTEM_REGISTRY["nexus"] = init_nexus(scheduler)
+    logger.info("Simulation Scheduler / C++ Bridge / Multiplayer Nexus ONLINE")
+except Exception as exc:
+    logger.critical("Core Game Engine bootstrap failed: %s", exc)
+
+try:
+    from core_engine.odre_core import reality_core
+    SYSTEM_REGISTRY["odre_engine"] = reality_core
+    logger.info("ODRE Engine ONLINE")
+except Exception as exc:
+    logger.warning("ODRE Engine unavailable: %s", exc)
+
+try:
+    from assets_factory.world_builder import world_forge
+    SYSTEM_REGISTRY["world_forge"] = world_forge
+    logger.info("Procedural World Builder ONLINE")
+except Exception as exc:
+    logger.warning("World Builder unavailable: %s", exc)
+
+# Streaming / live edit / builder / evolution
+try:
+    from pixel_streaming.stream_manager import PixelStreamEngine
+    SYSTEM_REGISTRY["pixel_stream"] = PixelStreamEngine()
+    logger.info("Pixel Streaming ONLINE")
+except Exception as exc:
+    logger.warning("Pixel Streaming unavailable: %s", exc)
+
+try:
+    from live_editor.hot_reloader import vibe_coder_engine
+    SYSTEM_REGISTRY["hot_reloader"] = vibe_coder_engine
+    logger.info("Live Editor ONLINE")
+except Exception as exc:
+    logger.warning("Live Editor unavailable: %s", exc)
+
+try:
+    from game_compilers.universal_builder import game_builder
+    SYSTEM_REGISTRY["builder"] = game_builder
+    logger.info("Universal Builder ONLINE")
+except Exception as exc:
+    logger.critical("Universal Builder failed: %s", exc)
+
+try:
+    from god_brain.self_evolution import EvolutionEngine
+    SYSTEM_REGISTRY["evolution"] = EvolutionEngine()
+    logger.info("Self-Evolution Engine ONLINE")
+except Exception as exc:
+    logger.warning("Self-Evolution unavailable: %s", exc)
+
+
+# ============================================================================
+# AUTHENTICATION
+# ============================================================================
+
+def _credential_is_valid(candidate: Optional[str]) -> bool:
+    if not MASTER_PIN or not candidate:
+        return False
+    return candidate == MASTER_PIN
+
+
+def _require_pin(candidate: Optional[str]) -> None:
+    if not _credential_is_valid(candidate):
+        if not MASTER_PIN:
+            raise HTTPException(status_code=503, detail="Master credential is not configured")
+        raise HTTPException(status_code=403, detail="ACCESS DENIED")
+
+
+async def _authorize_websocket(websocket: WebSocket) -> bool:
+    candidate = websocket.query_params.get("token") or websocket.headers.get("x-god-pin")
+    if not _credential_is_valid(candidate):
+        await websocket.close(code=1008, reason="Unauthorized")
+        return False
+    return True
+
+
+# ============================================================================
+# ENGINE TICK LOOP
+# ============================================================================
 
 async def engine_tick_loop() -> None:
-    """
-    Fixed-rate engine scheduler.
-
-    IMPORTANT:
-    Native/C++ execution is dispatched with asyncio.to_thread() so the
-    FastAPI event loop isn't blocked by subprocess or native execution.
-    """
-
-    scheduler = SYSTEM_REGISTRY.get(
-        "scheduler",
-    )
-
-    cpp_bridge = SYSTEM_REGISTRY.get(
-        "cpp_bridge",
-    )
-
+    """Run the scheduler at ~60Hz without blocking on native execution."""
+    logger.info("Master Engine Tick Loop Activated")
+    scheduler = SYSTEM_REGISTRY.get("scheduler")
+    cpp_bridge = SYSTEM_REGISTRY.get("cpp_bridge")
     if scheduler is None or cpp_bridge is None:
-        logger.error(
-            "Engine loop unavailable: scheduler or C++ bridge missing."
-        )
+        logger.error("Tick Loop disabled: Scheduler or C++ Bridge missing")
         return
 
-    tick_interval = 1.0 / ENGINE_TICK_HZ
-    next_tick = time.monotonic()
-
-    logger.info(
-        "Engine tick loop started at %d Hz.",
-        ENGINE_TICK_HZ,
-    )
+    interval = 1.0 / 60.0
+    next_tick = time.perf_counter()
 
     while True:
+        tick_started = time.perf_counter()
         try:
-            batches = scheduler.build_batches()
-
+            batches = await asyncio.to_thread(scheduler.build_batches)
             for batch in batches:
-                # Do NOT execute native/subprocess work directly on the
-                # FastAPI asyncio event loop.
-                await asyncio.to_thread(
-                    cpp_bridge.execute,
-                    batch,
-                )
-
+                # execute() is explicitly non-blocking in the advanced bridge.
+                result = cpp_bridge.execute(batch)
+                if isinstance(result, Mapping) and str(result.get("status")) in {
+                    "rejected",
+                    "unavailable",
+                    "failed",
+                }:
+                    logger.debug("Simulation submission returned %s", result)
         except asyncio.CancelledError:
-            logger.info(
-                "Engine tick loop stopping."
-            )
             raise
-
         except Exception:
-            logger.exception(
-                "Engine tick failed."
-            )
+            logger.exception("Engine Tick Error")
 
-        next_tick += tick_interval
+        elapsed = time.perf_counter() - tick_started
+        next_tick += interval
+        sleep_for = max(0.0, next_tick - time.perf_counter())
+        if elapsed > interval:
+            # Drop accumulated lag instead of creating an infinite catch-up loop.
+            next_tick = time.perf_counter()
+            sleep_for = 0.0
+        await asyncio.sleep(sleep_for)
 
-        sleep_for = next_tick - time.monotonic()
 
-        if sleep_for > 0:
-            await asyncio.sleep(
-                sleep_for,
-            )
-        else:
-            # The loop missed its deadline. Reset the schedule instead of
-            # creating an ever-growing backlog.
-            next_tick = time.monotonic()
+async def registry_maintenance_loop() -> None:
+    """Periodically age out task/project state without blocking request handlers."""
+    while True:
+        try:
+            await asyncio.sleep(30.0)
+            async with _task_lock:
+                await _purge_expired_locked(_active_tasks, ttl_seconds=CONFIG.task_ttl_seconds)
+            async with _project_lock:
+                await _purge_expired_locked(
+                    _generated_projects,
+                    ttl_seconds=CONFIG.project_ttl_seconds,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Registry maintenance failure")
 
 
 # ============================================================================
-# APPLICATION LIFECYCLE
+# FASTAPI LIFESPAN
 # ============================================================================
-
 
 @asynccontextmanager
-async def lifespan(
-    application: FastAPI,
-):
-    """
-    Deterministic Riot runtime lifecycle.
-    """
-
-    logger.info(
-        "Riot control plane starting."
-    )
-
-    connection_pool = SYSTEM_REGISTRY.get(
-        "connection_pool",
-    )
+async def lifespan(app: FastAPI):
+    logger.info("GOD NODE V2 BOOT SEQUENCE INITIATED")
+    connection_pool = SYSTEM_REGISTRY.get("connection_pool")
 
     if connection_pool is not None:
-        await connection_pool.startup()
+        await call_maybe_async(connection_pool.startup)
 
-    engine_task = asyncio.create_task(
-        engine_tick_loop(),
-        name="riot-engine-tick-loop",
-    )
+    tracked: list[asyncio.Task[Any]] = []
+    tracked.append(await _spawn(engine_tick_loop(), name="riot-engine-tick"))
+    tracked.append(await _spawn(registry_maintenance_loop(), name="riot-registry-maintenance"))
 
     try:
         yield
-
     finally:
-        logger.info(
-            "Riot control plane shutting down."
-        )
-
-        engine_task.cancel()
-
-        try:
-            await engine_task
-        except asyncio.CancelledError:
-            pass
-
-        active = list(
-            RUNNING_TASKS.values()
-        )
-
-        for task in active:
+        logger.info("GOD NODE V2 SHUTDOWN SEQUENCE INITIATED")
+        async with _runtime_task_lock:
+            pending = list(_runtime_tasks)
+        for task in pending:
             task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
-        if active:
-            await asyncio.gather(
-                *active,
-                return_exceptions=True,
-            )
-
-        RUNNING_TASKS.clear()
+        for resource_name in ("cpp_bridge", "nexus", "pixel_stream", "hot_reloader"):
+            resource = SYSTEM_REGISTRY.get(resource_name)
+            shutdown = getattr(resource, "shutdown", None)
+            if shutdown is not None:
+                with contextlib.suppress(Exception):
+                    await call_maybe_async(shutdown)
 
         if connection_pool is not None:
-            await connection_pool.shutdown()
-
-        logger.info(
-            "Riot shutdown complete."
-        )
+            with contextlib.suppress(Exception):
+                await call_maybe_async(connection_pool.shutdown)
 
 
 # ============================================================================
-# FASTAPI
+# APP
 # ============================================================================
-
 
 app = FastAPI(
-    title="Riot Control Plane",
-    version="11.0",
-    description=(
-        "Secure AI game-generation and simulation control plane."
-    ),
+    title="Riot / God Node",
+    version="11.0-production",
     lifespan=lifespan,
 )
 
-# A wildcard origin with credentials enabled is intentionally prohibited.
-#
-# If you explicitly configure "*" we disable credentials instead of creating
-# the unsafe "*" + credentials combination.
-USE_WILDCARD_CORS = ALLOWED_ORIGINS == ["*"]
-
+# Wildcard + credentials is intentionally forbidden. Empty origins means no CORS
+# expansion beyond same-origin requests unless explicitly configured.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=not USE_WILDCARD_CORS,
+    allow_origins=list(CONFIG.cors_origins),
+    allow_credentials=bool(CONFIG.cors_origins),
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=[
-        "Content-Type",
-        "Authorization",
-        "X-God-Master-Key",
-    ],
+    allow_headers=["Authorization", "Content-Type", "X-God-Pin"],
 )
 
-
-@app.middleware("http")
-async def security_headers(
-    request: Any,
-    call_next: Any,
-) -> Any:
-    response = await call_next(request)
-
-    response.headers.setdefault(
-        "X-Content-Type-Options",
-        "nosniff",
-    )
-
-    response.headers.setdefault(
-        "X-Frame-Options",
-        "DENY",
-    )
-
-    response.headers.setdefault(
-        "Referrer-Policy",
-        "no-referrer",
-    )
-
-    response.headers.setdefault(
-        "Permissions-Policy",
-        "camera=(), microphone=(), geolocation=()",
-    )
-
-    return response
+if SYSTEM_REGISTRY.get("gateway") is not None:
+    app.include_router(SYSTEM_REGISTRY["gateway"].get_router())
 
 
 # ============================================================================
-# GATEWAY ROUTER
+# SCHEMAS
 # ============================================================================
 
-gateway = SYSTEM_REGISTRY.get("gateway")
+class GodCommandPayload(BaseModel):
+    directive: str = Field(..., min_length=1, max_length=2_000_000)
+    master_pin: str = Field(..., min_length=1, max_length=256)
+    context_data: Dict[str, Any] = Field(default_factory=dict)
 
-if gateway is not None:
-    app.include_router(
-        gateway.get_router(),
-    )
+
+class BuildExportPayload(BaseModel):
+    game_id: str = Field(..., min_length=1, max_length=128)
+    target_platform: str = Field(...)
+    master_pin: str = Field(..., min_length=1, max_length=256)
+
+    @field_validator("game_id")
+    @classmethod
+    def validate_game_id(cls, value: str) -> str:
+        if not _ID_RE.fullmatch(value.strip()):
+            raise ValueError("invalid game_id")
+        return value.strip()
+
+    @field_validator("target_platform")
+    @classmethod
+    def validate_target(cls, value: str) -> str:
+        value = value.strip().lower()
+        aliases = {
+            "web_html5": "web",
+            "html5": "web",
+            "android": "mobile",
+            "apk": "mobile",
+            "windows": "pc",
+            "desktop": "pc",
+            "exe": "pc",
+        }
+        value = aliases.get(value, value)
+        if value not in {"web", "mobile", "pc"}:
+            raise ValueError("unsupported target_platform")
+        return value
+
+
+class WebRTCOfferPayload(BaseModel):
+    player_id: str = Field(..., min_length=1, max_length=128)
+    sdp: str = Field(..., min_length=1, max_length=2_000_000)
+    type: str = Field(..., min_length=1, max_length=64)
 
 
 # ============================================================================
-# HEALTH
+# GENERATION / BUILD PIPELINE
 # ============================================================================
 
+async def _execute_pipeline_task(
+    task_id: str,
+    directive: str,
+    context_data: Optional[Mapping[str, Any]] = None,
+) -> None:
+    async with _pipeline_semaphore:
+        await _set_task(task_id, status="ANALYZING", progress=5)
 
-@app.get(
-    "/healthz",
-    tags=["System"],
-)
-async def healthz() -> JSONResponse:
-    critical_components = {
-        "connection_pool",
-        "gateway",
-        "master_router",
-        "orchestrator",
-        "scheduler",
-        "cpp_bridge",
-        "nexus",
-    }
+        router = SYSTEM_REGISTRY.get("master_router")
+        orchestrator = SYSTEM_REGISTRY.get("orchestrator")
+        builder = SYSTEM_REGISTRY.get("builder")
 
-    missing = sorted(
-        component
-        for component in critical_components
-        if component not in SYSTEM_REGISTRY
-    )
+        try:
+            if router is None:
+                raise RuntimeError("Master Router offline")
+            if orchestrator is None:
+                raise RuntimeError("God Orchestrator offline")
+            if builder is None:
+                raise RuntimeError("Universal Builder offline")
 
-    status = (
-        "healthy"
-        if not missing
-        else "degraded"
-    )
+            # 1. Intent/resource planning.
+            routing_plan = await call_maybe_async(
+                router.analyze_and_allocate,
+                directive,
+            )
+            if not isinstance(routing_plan, Mapping):
+                routing_plan = {"raw": routing_plan}
 
+            await _set_task(
+                task_id,
+                status="ORCHESTRATING_SWARM",
+                progress=20,
+                result={"routing_plan": dict(routing_plan)},
+            )
+
+            # 2. Real source generation + QA via the advanced orchestrator.
+            architecture = routing_plan.get("architecture")
+            architecture = architecture if isinstance(architecture, Mapping) else {}
+            requested_platform = architecture.get("target_platform") or "web"
+            requested_platform = str(requested_platform).strip().lower()
+            if requested_platform == "web_html5":
+                requested_platform = "web"
+            elif requested_platform in {"android", "apk"}:
+                requested_platform = "mobile"
+            elif requested_platform in {"windows", "desktop", "exe"}:
+                requested_platform = "pc"
+
+            agent_count = int(architecture.get("agent_count") or (10 if requested_platform != "web" else 5))
+            agent_count = max(1, min(agent_count, 32))
+
+            await _set_task(task_id, status="GENERATING_PROJECT", progress=35)
+            swarm_result = await call_maybe_async(
+                orchestrator.generate_full_game_with_swarm,
+                prompt=directive,
+                agent_count=agent_count,
+            )
+
+            if not isinstance(swarm_result, Mapping):
+                raise RuntimeError("Orchestrator returned an invalid result envelope")
+            if str(swarm_result.get("status")).upper() != "SUCCESS":
+                raise RuntimeError(
+                    str(swarm_result.get("error") or swarm_result.get("message") or "Generation failed")
+                )
+
+            build_config = swarm_result.get("build_config")
+            if not isinstance(build_config, Mapping):
+                raise RuntimeError("Orchestrator did not return a real build_config")
+
+            game_id = str(swarm_result.get("game_id") or build_config.get("game_id") or "").strip()
+            build_id = str(swarm_result.get("build_id") or build_config.get("build_id") or "").strip()
+            if not _ID_RE.fullmatch(game_id) or not _ID_RE.fullmatch(build_id):
+                raise RuntimeError("Orchestrator returned invalid project identity")
+
+            # The orchestrator's validated target is the source of truth. Do not silently
+            # overwrite it from untrusted request data.
+            real_target = str(build_config.get("target_platform") or "web").strip().lower()
+            if real_target not in {"web", "mobile", "pc"}:
+                raise RuntimeError(f"unsupported generated target: {real_target}")
+
+            project_record = {
+                "game_id": game_id,
+                "build_id": build_id,
+                "target_platform": real_target,
+                "build_config": dict(build_config),
+                "pipeline": swarm_result.get("pipeline"),
+                "qa": swarm_result.get("qa"),
+                "project": swarm_result.get("project"),
+            }
+            await _store_project(project_record)
+
+            await _set_task(
+                task_id,
+                status="BUILDING",
+                progress=70,
+                result={
+                    "game_id": game_id,
+                    "build_id": build_id,
+                    "target_platform": real_target,
+                },
+                metadata={"source": "advanced_orchestrator"},
+            )
+
+            # 3. Actual builder invocation. No mock config, no synthetic bytes.
+            async with _build_semaphore:
+                build_result = await call_maybe_async(
+                    builder.build_game,
+                    dict(build_config),
+                )
+
+            if not isinstance(build_result, Mapping):
+                raise RuntimeError("Universal Builder returned an invalid result envelope")
+
+            status = str(build_result.get("status") or "FAILED").upper()
+            success = status == "SUCCESS" and bool(build_result.get("artifact"))
+
+            final_payload = {
+                "routing_plan": dict(routing_plan),
+                "generation": {
+                    "game_id": game_id,
+                    "build_id": build_id,
+                    "target_platform": real_target,
+                    "pipeline": swarm_result.get("pipeline"),
+                    "qa": swarm_result.get("qa"),
+                },
+                "build": dict(build_result),
+            }
+
+            await _set_task(
+                task_id,
+                status="SUCCESS" if success else status,
+                progress=100 if success else 100,
+                result=final_payload,
+                error=None if success else (dict(build_result).get("errors") or ["Build did not complete successfully"])[0],
+            )
+
+        except asyncio.CancelledError:
+            await _set_task(task_id, status="CANCELLED", progress=0)
+            raise
+        except Exception as exc:
+            logger.exception("Generation task %s failed", task_id)
+            await _set_task(
+                task_id,
+                status="FAILED",
+                progress=100,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+
+# ============================================================================
+# REST ENDPOINTS
+# ============================================================================
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_control_panel() -> HTMLResponse:
+    index_path = Path(__file__).resolve().parent / "index.html"
+    try:
+        content = await asyncio.to_thread(index_path.read_text, encoding="utf-8")
+        return HTMLResponse(content=content, status_code=200)
+    except FileNotFoundError:
+        return HTMLResponse(
+            content="<h1>God Node Active. index.html missing.</h1>",
+            status_code=200,
+        )
+
+
+@app.get("/api/v2/health")
+async def health() -> JSONResponse:
+    registry_keys = sorted(SYSTEM_REGISTRY.keys())
     return JSONResponse(
         status_code=200,
         content={
-            "status": status,
-            "environment": ENVIRONMENT,
-            "engine_tick_hz": ENGINE_TICK_HZ,
-            "components_online": sorted(
-                SYSTEM_REGISTRY.keys(),
-            ),
-            "critical_components_missing": missing,
-            "boot_failures": {
-                name: error
-                for name, error in BOOT_FAILURES.items()
-                if name in critical_components
+            "status": "ok",
+            "version": app.version,
+            "configured_master_credential": bool(MASTER_PIN),
+            "services": registry_keys,
+            "limits": {
+                "max_concurrent_pipelines": CONFIG.max_concurrent_pipelines,
+                "max_concurrent_builds": CONFIG.max_concurrent_builds,
+                "max_task_entries": CONFIG.max_task_entries,
+                "max_project_entries": CONFIG.max_project_entries,
             },
-            "active_tasks": len(
-                RUNNING_TASKS,
-            ),
         },
     )
 
 
-# ============================================================================
-# CONTROL PANEL
-# ============================================================================
-
-
-@app.get(
-    "/",
-    response_class=HTMLResponse,
-)
-async def serve_control_panel() -> HTMLResponse:
-    index_path = (
-        PROJECT_ROOT / "index.html"
-    )
-
-    if not index_path.is_file():
-        return HTMLResponse(
-            content=(
-                "<h1>Riot Control Plane Online</h1>"
-                "<p>index.html is not installed.</p>"
-            ),
-            status_code=200,
-        )
-
-    return HTMLResponse(
-        content=index_path.read_text(
-            encoding="utf-8",
-        ),
-        status_code=200,
-    )
-
-
-# ============================================================================
-# GAME GENERATION
-# ============================================================================
-
-
-@app.post(
-    "/api/v2/execute",
-)
-async def execute_command(
-    payload: GodCommandPayload,
-    x_god_master_key: str | None = Header(
-        default=None,
-        alias="X-God-Master-Key",
-    ),
-) -> JSONResponse:
-    _authorize(
-        payload.master_pin,
-        header_secret=x_god_master_key,
-    )
-
-    directive = payload.directive.strip()
-
-    if not directive:
-        raise HTTPException(
-            status_code=422,
-            detail="Directive cannot be empty.",
-        )
-
-    task_id = (
-        f"TASK_{uuid.uuid4().hex}"
-    )
-
-    TASKS.create(
+@app.post("/api/v2/execute")
+async def execute_command(payload: GodCommandPayload) -> JSONResponse:
+    _require_pin(payload.master_pin)
+    task_id = f"TASK_{uuid.uuid4().hex}"
+    await _set_task(
         task_id,
+        status="QUEUED",
+        progress=0,
+        kind="generation",
+        metadata={"directive_length": len(payload.directive)},
     )
-
-    task = asyncio.create_task(
-        process_god_command_task(
-            task_id=task_id,
-            directive=directive,
-            context_data=payload.context_data,
-        ),
-        name=f"riot-generation-{task_id}",
+    await _spawn(
+        _execute_pipeline_task(task_id, payload.directive, payload.context_data),
+        name=f"riot-pipeline-{task_id}",
     )
-
-    RUNNING_TASKS[task_id] = task
-
-    task.add_done_callback(
-        _task_done_callback(
-            task_id,
-        ),
-    )
-
     return JSONResponse(
         status_code=202,
-        content={
-            "status": "PROCESSING",
-            "task_id": task_id,
-        },
+        content={"status": "PROCESSING", "task_id": task_id},
     )
 
 
-# ============================================================================
-# TASK STATUS
-# ============================================================================
-
-
-@app.get(
-    "/api/v2/status/{task_id}",
-)
-async def check_status(
-    task_id: str,
-) -> JSONResponse:
-    task = TASKS.get(
-        task_id,
-    )
-
+@app.get("/api/v2/status/{task_id}")
+async def check_status(task_id: str) -> JSONResponse:
+    task_id = _validate_identity(task_id, "task_id")
+    task = await _get_task(task_id)
     if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return JSONResponse(status_code=200, content=task)
+
+
+@app.post("/api/v2/export")
+async def trigger_universal_build(payload: BuildExportPayload) -> JSONResponse:
+    """Build the exact real source bundle previously generated for a game."""
+    _require_pin(payload.master_pin)
+
+    builder = SYSTEM_REGISTRY.get("builder")
+    if builder is None:
+        raise HTTPException(status_code=503, detail="Universal Builder offline")
+
+    project = await _get_project(payload.game_id)
+    if project is None:
         raise HTTPException(
             status_code=404,
-            detail="Task not found.",
+            detail="Generated project not found or expired; run /api/v2/execute first",
         )
 
+    build_config = dict(project.get("build_config") or {})
+    if not build_config.get("source_bundle"):
+        raise HTTPException(status_code=409, detail="Stored project has no real source bundle")
+
+    generated_target = str(build_config.get("target_platform") or "web").lower()
+    if generated_target != payload.target_platform:
+        # Explicit platform conversion is not safe unless the generated project itself
+        # declares a compatible target. Fail closed instead of fabricating an adaptation.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Generated project targets {generated_target!r}; requested "
+                f"{payload.target_platform!r}. Regenerate for the desired target."
+            ),
+        )
+
+    build_task_id = f"BUILD_{uuid.uuid4().hex}"
+    await _set_task(
+        build_task_id,
+        status="QUEUED",
+        progress=0,
+        kind="build",
+        metadata={"game_id": payload.game_id, "target_platform": generated_target},
+    )
+
+    async def _run_export() -> None:
+        async with _build_semaphore:
+            try:
+                await _set_task(build_task_id, status="BUILDING", progress=25)
+                result = await call_maybe_async(builder.build_game, build_config)
+                status = str(result.get("status") if isinstance(result, Mapping) else "FAILED").upper()
+                success = status == "SUCCESS" and isinstance(result, Mapping) and bool(result.get("artifact"))
+                await _set_task(
+                    build_task_id,
+                    status="SUCCESS" if success else status,
+                    progress=100,
+                    result=result,
+                    error=None if success else "Build failed or produced no verified artifact",
+                )
+            except asyncio.CancelledError:
+                await _set_task(build_task_id, status="CANCELLED", progress=0)
+                raise
+            except Exception as exc:
+                logger.exception("Build %s failed", build_task_id)
+                await _set_task(
+                    build_task_id,
+                    status="FAILED",
+                    progress=100,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
+    await _spawn(_run_export(), name=f"riot-export-{build_task_id}")
     return JSONResponse(
-        status_code=200,
-        content=task,
+        status_code=202,
+        content={"status": "BUILD_QUEUED", "build_task_id": build_task_id},
     )
 
 
-# ============================================================================
-# EXPORT
-# ============================================================================
-
-
-@app.post(
-    "/api/v2/export",
-)
-async def trigger_universal_build(
-    payload: BuildExportPayload,
-    x_god_master_key: str | None = Header(
-        default=None,
-        alias="X-God-Master-Key",
-    ),
-) -> JSONResponse:
-    _authorize(
-        payload.master_pin,
-        header_secret=x_god_master_key,
-    )
-
-    builder = SYSTEM_REGISTRY.get(
-        "builder",
-    )
-
-    if builder is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Universal builder unavailable.",
-        )
-
-    # The artifact store integration is intentionally kept for the next
-    # file-by-file upgrade. We preserve the current builder contract here.
-    build_config = {
-        "game_id": payload.game_id,
-        "target_platform": payload.target_platform,
-        "html_content": (
-            "<!-- Riot build pipeline placeholder. -->"
-            "<canvas id='game'></canvas>"
-        ),
-        "js_content": (
-            "console.log('Riot build pipeline online');"
-        ),
-    }
-
-    try:
-        result = await builder.build_game(
-            build_config,
-        )
-
-        return JSONResponse(
-            status_code=200,
-            content=result,
-        )
-
-    except Exception:
-        logger.exception(
-            "Build failed for game %s",
-            payload.game_id,
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail="Build pipeline failed.",
-        )
-
-
-# ============================================================================
-# SELF EVOLUTION
-# ============================================================================
-
-
-@app.post(
-    "/api/v2/evolve",
-)
-async def trigger_self_evolution(
-    pin: str | None = None,
-    x_god_master_key: str | None = Header(
-        default=None,
-        alias="X-God-Master-Key",
-    ),
-) -> JSONResponse:
-    _authorize(
-        pin,
-        header_secret=x_god_master_key,
-    )
-
-    evolution_engine = SYSTEM_REGISTRY.get(
-        "evolution",
-    )
-
+@app.post("/api/v2/evolve")
+async def trigger_self_evolution(pin: str) -> JSONResponse:
+    _require_pin(pin)
+    evolution_engine = SYSTEM_REGISTRY.get("evolution")
     if evolution_engine is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Evolution engine unavailable.",
-        )
+        raise HTTPException(status_code=503, detail="Evolution Engine offline")
 
-    try:
-        result = await evolution_engine.evolve()
+    task_id = f"EVOLVE_{uuid.uuid4().hex}"
+    await _set_task(task_id, status="QUEUED", progress=0, kind="evolution")
 
-        return JSONResponse(
-            status_code=200,
-            content=result,
-        )
+    async def _run_evolve() -> None:
+        try:
+            await _set_task(task_id, status="RUNNING", progress=10)
+            result = await call_maybe_async(evolution_engine.evolve)
+            await _set_task(task_id, status="SUCCESS", progress=100, result=result)
+        except asyncio.CancelledError:
+            await _set_task(task_id, status="CANCELLED", progress=0)
+            raise
+        except Exception as exc:
+            logger.exception("Evolution %s failed", task_id)
+            await _set_task(
+                task_id,
+                status="FAILED",
+                progress=100,
+                error=f"{type(exc).__name__}: {exc}",
+            )
 
-    except Exception:
-        logger.exception(
-            "Self-evolution request failed."
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail="Self-evolution pipeline failed.",
-        )
-
-
-# ============================================================================
-# WEBRTC
-# ============================================================================
+    await _spawn(_run_evolve(), name=f"riot-evolution-{task_id}")
+    return JSONResponse(status_code=202, content={"status": "EVOLVE_QUEUED", "task_id": task_id})
 
 
-@app.post(
-    "/api/v2/stream/offer",
-)
+@app.post("/api/v2/stream/offer")
 async def webrtc_handshake(
     payload: WebRTCOfferPayload,
+    x_god_pin: Optional[str] = Header(default=None),
 ) -> JSONResponse:
-    stream_engine = SYSTEM_REGISTRY.get(
-        "pixel_stream",
-    )
-
+    _require_pin(x_god_pin)
+    stream_engine = SYSTEM_REGISTRY.get("pixel_stream")
     if stream_engine is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Pixel streaming unavailable.",
-        )
-
+        raise HTTPException(status_code=503, detail="Pixel Stream Engine offline")
     try:
-        result = (
-            await stream_engine.create_stream_connection(
-                player_id=payload.player_id,
-                offer_sdp=payload.sdp,
-                offer_type=payload.type,
-            )
+        result = await call_maybe_async(
+            stream_engine.create_stream_connection,
+            player_id=payload.player_id,
+            offer_sdp=payload.sdp,
+            offer_type=payload.type,
         )
-
-        return JSONResponse(
-            status_code=200,
-            content=result,
-        )
-
-    except Exception:
-        logger.exception(
-            "WebRTC handshake failed for player %s",
-            payload.player_id,
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail="WebRTC handshake failed.",
-        )
+        return JSONResponse(status_code=200, content=result)
+    except Exception as exc:
+        logger.exception("WebRTC Handshake failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 # ============================================================================
-# LIVE EDITOR
+# WEBSOCKETS
 # ============================================================================
 
+async def _start_heartbeat(websocket: WebSocket) -> None:
+    try:
+        while True:
+            await asyncio.sleep(CONFIG.heartbeat_seconds)
+            await websocket.send_json({"type": "heartbeat", "ts": time.time()})
+    except (asyncio.CancelledError, Exception):
+        return
 
-@app.websocket(
-    "/live-edit/{game_id}",
-)
-async def ws_vibe_coder(
-    websocket: WebSocket,
-    game_id: str,
-) -> None:
-    reloader = SYSTEM_REGISTRY.get(
-        "hot_reloader",
-    )
 
+@app.websocket("/live-edit/{game_id}")
+async def ws_vibe_coder(websocket: WebSocket, game_id: str) -> None:
+    game_id = _validate_identity(game_id, "game_id")
+    if not await _authorize_websocket(websocket):
+        return
+
+    reloader = SYSTEM_REGISTRY.get("hot_reloader")
     if reloader is None:
-        await websocket.close(
-            code=1011,
-            reason="Hot Reloader Offline",
-        )
+        await websocket.close(code=1011, reason="Hot Reloader Offline")
         return
 
-    await reloader.connection_manager.connect(
-        game_id,
-        websocket,
-    )
-
+    await websocket.accept()
+    heartbeat_task = asyncio.create_task(_start_heartbeat(websocket))
     try:
+        await call_maybe_async(reloader.connection_manager.connect, game_id, websocket)
         while True:
-            await websocket.receive_json()
-
-    except WebSocketDisconnect:
-        reloader.connection_manager.disconnect(
-            game_id,
-        )
-
+            try:
+                data = await asyncio.wait_for(websocket.receive_json(), timeout=60.0)
+            except asyncio.TimeoutError:
+                continue
+            except WebSocketDisconnect:
+                break
+            await call_maybe_async(reloader.handle_update, game_id, data)
     except Exception:
-        logger.exception(
-            "Live editor WebSocket failed: %s",
-            game_id,
-        )
-
-        reloader.connection_manager.disconnect(
-            game_id,
-        )
+        logger.exception("Hot-reload WebSocket failure for %s", game_id)
+    finally:
+        heartbeat_task.cancel()
+        with contextlib.suppress(Exception):
+            await call_maybe_async(reloader.connection_manager.disconnect, game_id)
 
 
-# ============================================================================
-# MULTIPLAYER
-# ============================================================================
+@app.websocket("/ws/multiplayer/{player_id}")
+async def ws_multiplayer_nexus(websocket: WebSocket, player_id: str) -> None:
+    player_id = _validate_identity(player_id, "player_id")
+    if not await _authorize_websocket(websocket):
+        return
 
-
-@app.websocket(
-    "/ws/multiplayer/{player_id}",
-)
-async def ws_multiplayer_nexus(
-    websocket: WebSocket,
-    player_id: str,
-) -> None:
-    nexus = SYSTEM_REGISTRY.get(
-        "nexus",
-    )
-
+    nexus = SYSTEM_REGISTRY.get("nexus")
     if nexus is None:
-        await websocket.close(
-            code=1011,
-            reason="Nexus Offline",
-        )
+        await websocket.close(code=1011, reason="Nexus Offline")
         return
 
-    await nexus.connect_player(
-        player_id,
-        websocket,
-    )
-
+    await websocket.accept()
+    heartbeat_task = asyncio.create_task(_start_heartbeat(websocket))
     try:
+        await call_maybe_async(nexus.connect_player, player_id, websocket)
         while True:
-            data = await websocket.receive_json()
-
-            await nexus.process_action(
-                player_id,
-                data,
-            )
-
-    except WebSocketDisconnect:
-        nexus.disconnect_player(
-            player_id,
-        )
-
+            try:
+                data = await asyncio.wait_for(websocket.receive_json(), timeout=60.0)
+            except asyncio.TimeoutError:
+                continue
+            except WebSocketDisconnect:
+                break
+            await call_maybe_async(nexus.process_action, player_id, data)
     except Exception:
-        logger.exception(
-            "Multiplayer WebSocket failed: %s",
-            player_id,
-        )
-
-        nexus.disconnect_player(
-            player_id,
-        )
+        logger.exception("Multiplayer WebSocket failure for %s", player_id)
+    finally:
+        heartbeat_task.cancel()
+        with contextlib.suppress(Exception):
+            await call_maybe_async(nexus.disconnect_player, player_id)
 
 
 # ============================================================================
-# LOCAL DEVELOPMENT ENTRYPOINT
+# SERVER ENTRYPOINT
 # ============================================================================
-
 
 if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
         "main:app",
-        host=os.getenv(
-            "GOD_HOST",
-            "0.0.0.0",
-        ),
-        port=int(
-            os.getenv(
-                "GOD_PORT",
-                "8000",
-            )
-        ),
-        reload=(
-            ENVIRONMENT
-            in {"development", "dev"}
-        ),
-        log_level=LOG_LEVEL.lower(),
+        host=os.getenv("RIOT_BIND_HOST", "0.0.0.0"),
+        port=int(os.getenv("RIOT_BIND_PORT", "8000")),
+        reload=False,
+        log_level=os.getenv("RIOT_UVICORN_LOG_LEVEL", "info"),
     )
