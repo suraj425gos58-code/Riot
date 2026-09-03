@@ -38,6 +38,12 @@ from dataclasses import asdict, dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional, Sequence
 
+try:
+    from god_brain.voice_engine import VoiceEngine, VoiceFormat, VoiceProfile, VoiceSynthesisRequest, VoiceTaskType
+except Exception:
+    VoiceEngine = None
+    VoiceFormat = VoiceProfile = VoiceSynthesisRequest = VoiceTaskType = None
+
 
 logger = logging.getLogger("GodOrchestrator")
 
@@ -73,6 +79,8 @@ DEFAULT_MAX_MAP_SECTORS = max(
 DEFAULT_MAX_SOURCE_BYTES = max(
     1024 * 1024, int(os.getenv("RIOT_MAX_SOURCE_BYTES", str(25 * 1024 * 1024)))
 )
+DEFAULT_MAX_VOICE_LINES = max(1, int(os.getenv("RIOT_MAX_VOICE_LINES", "64")))
+DEFAULT_VOICE_CONCURRENCY = max(1, int(os.getenv("RIOT_VOICE_ORCHESTRATOR_CONCURRENCY", "4")))
 
 _GAME_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _ALLOWED_SOURCE_SUFFIXES = {
@@ -109,6 +117,9 @@ class OrchestratorConfig:
     max_source_bytes: int = DEFAULT_MAX_SOURCE_BYTES
     require_qa: bool = True
     fail_on_partial_swarm: bool = False
+    enable_voice: bool = True
+    max_voice_lines: int = DEFAULT_MAX_VOICE_LINES
+    voice_concurrency: int = DEFAULT_VOICE_CONCURRENCY
 
 
 @dataclass(slots=True)
@@ -133,6 +144,15 @@ class SourceFile:
 
 
 @dataclass(slots=True)
+class BinarySourceFile:
+    path: str
+    content: bytes
+
+    def size_bytes(self) -> int:
+        return len(self.content)
+
+
+@dataclass(slots=True)
 class GeneratedProject:
     game_id: str
     build_id: str
@@ -144,13 +164,15 @@ class GeneratedProject:
     physics: Any
     gameplay: list[Any]
     source_files: list[SourceFile]
+    binary_files: list[BinarySourceFile] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_builder_config(self) -> dict[str, Any]:
-        files = {
+        files: dict[str, Any] = {
             item.path: item.content
             for item in self.source_files
         }
+        files.update({item.path: item.content for item in self.binary_files})
         return {
             "game_id": self.game_id,
             "build_id": self.build_id,
@@ -394,6 +416,9 @@ def _validate_sources(files: Sequence[SourceFile], max_bytes: int) -> None:
         if item.path in seen:
             raise ValueError(f"duplicate generated source path: {item.path}")
         seen.add(item.path)
+        suffix = PurePosixPath(item.path).suffix.lower()
+        if suffix and suffix not in _ALLOWED_SOURCE_SUFFIXES:
+            raise ValueError(f"unsupported generated source suffix: {item.path}")
         size = item.size_bytes()
         if size <= 0:
             raise ValueError(f"empty generated source file: {item.path}")
@@ -402,6 +427,22 @@ def _validate_sources(files: Sequence[SourceFile], max_bytes: int) -> None:
             raise ValueError(
                 f"generated source exceeds {max_bytes} byte orchestration limit"
             )
+
+
+def _validate_binary_sources(files: Sequence[BinarySourceFile], max_bytes: int, seen: set[str]) -> None:
+    total = 0
+    allowed = {".wav", ".mp3", ".ogg", ".opus", ".flac", ".m4a", ".aac", ".png", ".jpg", ".jpeg", ".webp", ".glb", ".gltf", ".bin"}
+    for item in files:
+        if item.path in seen:
+            raise ValueError(f"duplicate generated source path: {item.path}")
+        seen.add(item.path)
+        if not isinstance(item.content, (bytes, bytearray)) or not item.content:
+            raise ValueError(f"empty generated binary asset: {item.path}")
+        if PurePosixPath(item.path).suffix.lower() not in allowed:
+            raise ValueError(f"unsupported generated binary asset suffix: {item.path}")
+        total += len(item.content)
+        if total > max_bytes:
+            raise ValueError(f"generated binary assets exceed {max_bytes} byte orchestration limit")
 
 
 # ============================================================================
@@ -453,6 +494,7 @@ class GodOrchestrator:
         map_builder: Any = None,
         physics: Any = None,
         qa_tester: Any = None,
+        voice_engine: Any = None,
     ) -> None:
         from god_brain.agents.director_agent import DirectorAgent
         from god_brain.agents.asset_generator_agent import AssetGeneratorAgent
@@ -467,6 +509,12 @@ class GodOrchestrator:
         self.map_builder = map_builder or MapBuilderAgent()
         self.physics = physics or PhysicsAgent()
         self.qa_tester = qa_tester or QATesterAgent()
+        if voice_engine is not None:
+            self.voice_engine = voice_engine
+        elif self.config.enable_voice and VoiceEngine is not None:
+            self.voice_engine = VoiceEngine(concurrency=self.config.voice_concurrency)
+        else:
+            self.voice_engine = None
 
         self.semaphore = asyncio.Semaphore(self.config.max_concurrent_agents)
 
@@ -713,6 +761,91 @@ class GodOrchestrator:
         )
         state.add_result(result)
         return result
+
+    @staticmethod
+    def _extract_voice_specs(plan: Any, prompt: str, limit: int) -> list[dict[str, Any]]:
+        candidates: list[Any] = []
+        if isinstance(plan, Mapping):
+            for key in ("voice_lines", "dialogue", "dialogues", "narration", "voice", "audio_dialogue", "sound"):
+                value = plan.get(key)
+                if isinstance(value, (list, tuple)):
+                    candidates.extend(value)
+                elif isinstance(value, Mapping):
+                    candidates.append(value)
+                elif isinstance(value, str) and value.strip():
+                    candidates.append(value)
+        if not candidates and isinstance(plan, Mapping):
+            text = plan.get("opening_narration") or plan.get("intro")
+            if isinstance(text, str) and text.strip():
+                candidates.append({"text": text, "task_type": "narration"})
+        specs: list[dict[str, Any]] = []
+        for index, item in enumerate(candidates[:limit]):
+            if isinstance(item, str):
+                text = item.strip()
+                data: dict[str, Any] = {"text": text, "task_type": "dialogue"}
+            elif isinstance(item, Mapping):
+                text = str(item.get("text") or item.get("line") or item.get("dialogue") or item.get("script") or "").strip()
+                if not text:
+                    continue
+                data = dict(item)
+                data["text"] = text
+            else:
+                continue
+            data.setdefault("id", f"voice_line_{index:04d}")
+            specs.append(data)
+        return specs
+
+    async def _generate_voice_assets(self, state: PipelineState, plan: Any) -> tuple[list[Any], list[BinarySourceFile], list[dict[str, Any]]]:
+        if not self.voice_engine or not self.config.enable_voice:
+            return [], [], []
+        specs = self._extract_voice_specs(plan, state.prompt, self.config.max_voice_lines)
+        if not specs:
+            return [], [], []
+        try:
+            startup = getattr(self.voice_engine, "startup", None)
+            if callable(startup):
+                result = startup()
+                if inspect.isawaitable(result):
+                    await result
+            requests = []
+            for spec in specs:
+                task_type_raw = str(spec.get("task_type", "dialogue")).lower()
+                mapping = {"tts": "tts", "dialogue": "dialogue", "narration": "narration", "sfx": "sfx", "music": "music"}
+                task_type = VoiceTaskType(mapping.get(task_type_raw, "dialogue"))
+                profile = VoiceProfile(
+                    voice_id=spec.get("voice_id"), language=spec.get("language"), locale=spec.get("locale"),
+                    gender=spec.get("gender"), style=spec.get("style"), emotion=spec.get("emotion"),
+                    speaking_rate=float(spec.get("speaking_rate", 1.0)), pitch=float(spec.get("pitch", 0.0)),
+                    volume=float(spec.get("volume", 1.0)), stability=spec.get("stability"),
+                    similarity=spec.get("similarity"), expressiveness=spec.get("expressiveness"),
+                    provider_options=spec.get("provider_options", {}) if isinstance(spec.get("provider_options", {}), Mapping) else {},
+                )
+                requests.append(VoiceSynthesisRequest(
+                    text=str(spec["text"]), game_id=state.game_id, task_type=task_type, profile=profile,
+                    output_format=VoiceFormat(str(spec.get("format", "mp3")).lower()),
+                    metadata={"line_id": spec["id"], "build_id": state.build_id},
+                    preferred_provider=spec.get("preferred_provider"),
+                ))
+            artifacts = await self.voice_engine.synthesize_many(requests, fail_fast=False)
+            binary_files: list[BinarySourceFile] = []
+            manifest: list[dict[str, Any]] = []
+            for artifact in artifacts:
+                record = artifact.to_dict() if hasattr(artifact, "to_dict") else dict(artifact)
+                record["build_relative_path"] = f"audio/{artifact.asset_id}.{artifact.format}"
+                path = getattr(artifact, "path", None)
+                if path and os.path.isfile(path):
+                    with open(path, "rb") as handle:
+                        payload = handle.read()
+                    binary_files.append(BinarySourceFile(record["build_relative_path"], payload))
+                    record["packaged"] = True
+                else:
+                    record["packaged"] = False
+                manifest.append(record)
+            return artifacts, binary_files, manifest
+        except Exception as exc:
+            state.warnings.append(f"voice generation unavailable: {type(exc).__name__}: {exc}")
+            logger.warning("Voice generation failed for %s: %s", state.build_id, exc)
+            return [], [], []
 
     async def _gameplay_synthesis(
         self,
@@ -1014,7 +1147,14 @@ requestAnimationFrame(tick);
                 physics = _extract_agent_payload(physics_result.result)
 
                 # ---------------------------------------------------------
-                # 5. REAL SOURCE ASSEMBLY
+                # 5. VOICE / AUDIO GENERATION
+                # ---------------------------------------------------------
+                voice_artifacts, voice_binary_files, voice_manifest = await self._generate_voice_assets(
+                    state, plan
+                )
+
+                # ---------------------------------------------------------
+                # 6. REAL SOURCE ASSEMBLY
                 # ---------------------------------------------------------
                 source_files = await self._gameplay_synthesis(
                     state,
@@ -1023,6 +1163,15 @@ requestAnimationFrame(tick);
                     world,
                     physics,
                 )
+                source_files.append(SourceFile(
+                    "audio-manifest.json",
+                    json.dumps({
+                        "schema": "riot.audio.v1",
+                        "game_id": state.game_id,
+                        "build_id": state.build_id,
+                        "assets": voice_manifest,
+                    }, ensure_ascii=False, indent=2),
+                ))
 
                 project = GeneratedProject(
                     game_id=state.game_id,
@@ -1035,17 +1184,25 @@ requestAnimationFrame(tick);
                     physics=physics,
                     gameplay=[],
                     source_files=source_files,
+                    binary_files=voice_binary_files,
                     metadata={
                         "pipeline_schema": "riot.orchestrator.v2",
                         "asset_count": len(assets),
                         "world_sector_count": len(world),
                         "source_file_count": len(source_files),
+                        "voice_asset_count": len(voice_manifest),
+                        "voice_assets": voice_manifest,
                     },
                 )
 
                 _validate_sources(
                     project.source_files,
                     self.config.max_source_bytes,
+                )
+                _validate_binary_sources(
+                    project.binary_files,
+                    self.config.max_source_bytes,
+                    {item.path for item in project.source_files},
                 )
 
                 # ---------------------------------------------------------
@@ -1194,5 +1351,6 @@ __all__ = [
     "PipelineStage",
     "PipelineState",
     "SourceFile",
+    "BinarySourceFile",
     "generate_full_game_with_swarm",
 ]
