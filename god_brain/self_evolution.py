@@ -60,8 +60,8 @@ class EvolutionConfig:
     
     # GitHub Authentication (from secure environment variables)
     GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-    GITHUB_OWNER = os.getenv("GITHUB_OWNER", "k8763027-lgtm")
-    GITHUB_REPO = os.getenv("GITHUB_REPO", "god-node-V2")
+    GITHUB_OWNER = os.getenv("GITHUB_OWNER", "")
+    GITHUB_REPO = os.getenv("GITHUB_REPO", "Riot")
     GITHUB_BRANCH_PREFIX = "auto-evolution"
     
     # Local development paths
@@ -74,18 +74,17 @@ class EvolutionConfig:
     MAX_FILE_SIZE_KB = 100  # Maximum generated file size
     MAX_GENERATION_TIME_SEC = 60  # Max time for code generation
     ALLOWED_DIRS = [
-        "god_brain",
-        "core",
-        "core_engine",
-        "multiplayer_nexus",
-        "pixel_streaming",
-        "security_vault",
+        "god_brain", "core", "core_engine", "multiplayer_nexus",
+        "pixel_streaming", "security_vault", "simulation_scheduler",
+        "assets_factory", "cloud_storage", "economy_vault", "deployment",
+        "game_compilers", "live_editor", "mobile_services", "the_god_router",
+        "config",
     ]
     
     # PR settings
     PR_LABEL = "auto-generated"
     PR_DRAFT = True  # Create as draft PR
-    PR_REQUEST_REVIEWERS = ["k8763027-lgtm"]  # Your GitHub username
+    PR_REQUEST_REVIEWERS = [x.strip() for x in os.getenv("RIOT_EVOLUTION_REVIEWERS", "").split(",") if x.strip()]
     
     # AST safety rules
     DANGEROUS_IMPORTS = [
@@ -206,10 +205,9 @@ class ASTSecurityValidator:
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    if any(danger in alias.name for danger in ["subprocess", "os", "sys"]):
-                        self.warnings.append(
-                            f"⚠️  Imported system module: {alias.name}. "
-                            f"This will be reviewed in PR."
+                    if alias.name.split(".", 1)[0] in {"subprocess", "ctypes", "socket"}:
+                        self.security_issues.append(
+                            f"🚫 BLOCKED: sensitive system import: {alias.name}"
                         )
             
             elif isinstance(node, ast.ImportFrom):
@@ -280,146 +278,219 @@ class ASTSecurityValidator:
 # REPOSITORY SCANNER
 # ============================================================================
 class RepositoryMetaScanner:
-    """Scans entire repository to identify missing modules and bottlenecks"""
-    
+    """Deep repository scanner for syntax, imports, architecture and resource risks."""
+
+    _SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", "venv", ".venv", "node_modules", "dist", "build", ".evolution_workspace", "backups"}
+    _IMPORT_ROOTS = {"god_brain", "core", "core_engine", "multiplayer_nexus", "pixel_streaming", "security_vault", "simulation_scheduler", "assets_factory", "cloud_storage", "economy_vault", "deployment", "game_compilers", "live_editor", "mobile_services", "the_god_router", "config"}
+
     def __init__(self, base_dir: str = EvolutionConfig.BASE_DIR):
-        self.base_dir = base_dir
+        self.base_dir = os.path.abspath(base_dir)
         self.python_files: List[str] = []
         self.imports_map: Dict[str, List[str]] = {}
         self.missing_modules: List[ModuleAnalysis] = []
-    
+        self.scan_issues: List[Dict[str, Any]] = []
+
     def scan_repository(self) -> Tuple[List[ModuleAnalysis], Dict[str, Any]]:
-        """
-        Perform comprehensive repository scan
-        
-        Returns:
-            Tuple[missing_modules, metrics]
-        """
-        logger.info("🔍 Starting repository meta-scan...")
-        
-        try:
-            # Phase 1: Collect all Python files
-            self._collect_python_files()
-            logger.info(f"✅ Found {len(self.python_files)} Python files")
-            
-            # Phase 2: Analyze imports and dependencies
-            self._analyze_dependencies()
-            logger.info(f"✅ Analyzed {len(self.imports_map)} modules")
-            
-            # Phase 3: Detect missing modules
-            self._detect_missing_modules()
-            logger.info(f"✅ Detected {len(self.missing_modules)} potential gaps")
-            
-            # Phase 4: Performance analysis
-            metrics = self._analyze_performance()
-            
-            return self.missing_modules, metrics
-            
-        except Exception as e:
-            logger.error(f"❌ Repository scan failed: {e}")
-            return [], {}
-    
-    def _collect_python_files(self) -> None:
-        """Recursively collect all .py files"""
-        for root, dirs, files in os.walk(self.base_dir):
-            # Skip directories
-            dirs[:] = [d for d in dirs if d not in [
-                ".git", "__pycache__", ".pytest_cache", "venv", "node_modules"
-            ]]
-            
-            for file in files:
-                if file.endswith(".py"):
-                    full_path = os.path.join(root, file)
-                    self.python_files.append(full_path)
-    
-    def _analyze_dependencies(self) -> None:
-        """Extract imports from all files"""
-        for file_path in self.python_files:
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                
-                tree = ast.parse(content)
-                imports = []
-                
-                for node in ast.walk(tree):
-                    if isinstance(node, ast.Import):
-                        for alias in node.names:
-                            imports.append(alias.name.split('.')[0])
-                    elif isinstance(node, ast.ImportFrom):
-                        if node.module:
-                            imports.append(node.module.split('.')[0])
-                
-                self.imports_map[file_path] = list(set(imports))
-                
-            except Exception as e:
-                logger.warning(f"⚠️  Failed to parse {file_path}: {e}")
-    
-    def _detect_missing_modules(self) -> None:
-        """Detect missing or outdated modules"""
-        # Module templates for missing features
-        missing_templates = {
-            "neural_compiler": {
-                "type": "compiler",
-                "reason": "Advanced DSL compiler for game definition language not found",
-                "location": "god_brain/neural_compiler.py",
-                "priority": "high",
-                "complexity": 8,
-                "dependencies": ["ast", "types", "abc"],
-            },
-            "consciousness_engine": {
-                "type": "agent",
-                "reason": "NPC consciousness & emotional state engine missing",
-                "location": "god_brain/consciousness_engine.py",
-                "priority": "high",
-                "complexity": 9,
-                "dependencies": ["god_brain.agents.base_agent"],
-            },
-            "performance_monitor": {
-                "type": "optimizer",
-                "reason": "Real-time performance monitoring & optimization engine",
-                "location": "core/performance_monitor.py",
-                "priority": "medium",
-                "complexity": 7,
-                "dependencies": ["asyncio", "psutil"],
-            },
-        }
-        
-        for module_id, template in missing_templates.items():
-            target_file = os.path.join(self.base_dir, template["location"])
-            
-            # Check if module exists
-            if not os.path.exists(target_file):
-                analysis = ModuleAnalysis(
-                    module_name=module_id,
-                    module_type=template["type"],
-                    reason=template["reason"],
-                    priority=template["priority"],
-                    suggested_location=template["location"],
-                    estimated_complexity=template["complexity"],
-                    dependencies=template["dependencies"],
-                    confidence_score=0.95,
-                )
-                self.missing_modules.append(analysis)
-    
-    def _analyze_performance(self) -> Dict[str, Any]:
-        """Analyze performance metrics"""
+        """Perform a deterministic deep scan without mutating the repository."""
+        started = datetime.datetime.utcnow()
+        self.python_files.clear()
+        self.imports_map.clear()
+        self.missing_modules.clear()
+        self.scan_issues.clear()
+        logger.info("Starting deep repository meta-scan: %s", self.base_dir)
+
+        self._collect_python_files()
+        syntax_errors = self._scan_syntax_and_imports()
+        unresolved_internal = self._scan_internal_imports()
+        duplicate_modules = self._detect_duplicate_module_names()
+        security_findings = self._scan_source_risks()
+        dependency_findings = self._scan_dependency_drift()
+        self._detect_missing_modules()
+
         total_lines = 0
-        for f in self.python_files:
+        total_bytes = 0
+        largest: List[Tuple[int, str]] = []
+        for path in self.python_files:
             try:
-                with open(f, 'r', encoding='utf-8') as file:
-                    total_lines += len(file.readlines())
-            except:
-                pass
-        
-        avg_file_size = total_lines / len(self.python_files) if self.python_files else 0
-        
-        return {
+                stat = os.stat(path)
+                total_bytes += stat.st_size
+                with open(path, "rb") as handle:
+                    line_count = sum(1 for _ in handle)
+                total_lines += line_count
+                largest.append((stat.st_size, os.path.relpath(path, self.base_dir)))
+            except OSError as exc:
+                self.scan_issues.append({"kind": "read_error", "file": path, "detail": str(exc)})
+        largest.sort(reverse=True)
+        duration_ms = (datetime.datetime.utcnow() - started).total_seconds() * 1000.0
+
+        metrics: Dict[str, Any] = {
+            "schema": "riot.evolution.scan.v2",
             "total_files": len(self.python_files),
             "total_lines": total_lines,
-            "avg_file_size": avg_file_size,
+            "total_bytes": total_bytes,
+            "avg_file_size": total_lines / len(self.python_files) if self.python_files else 0,
+            "largest_files": [{"path": path, "bytes": size} for size, path in largest[:10]],
+            "syntax_errors": syntax_errors,
+            "unresolved_internal_imports": unresolved_internal,
+            "duplicate_module_names": duplicate_modules,
+            "security_findings": security_findings,
+            "dependency_findings": dependency_findings,
+            "missing_module_candidates": len(self.missing_modules),
+            "issues": self.scan_issues,
+            "scan_duration_ms": round(duration_ms, 2),
             "scan_timestamp": datetime.datetime.utcnow().isoformat(),
         }
+        logger.info(
+            "Deep scan complete files=%d syntax_errors=%d unresolved=%d issues=%d",
+            len(self.python_files), syntax_errors, unresolved_internal, len(self.scan_issues),
+        )
+        return self.missing_modules, metrics
+
+    def _collect_python_files(self) -> None:
+        for root, dirs, files in os.walk(self.base_dir):
+            dirs[:] = [d for d in dirs if d not in self._SKIP_DIRS and not d.startswith(".")]
+            for filename in files:
+                if filename.endswith(".py"):
+                    self.python_files.append(os.path.join(root, filename))
+        self.python_files.sort()
+
+    def _scan_syntax_and_imports(self) -> int:
+        errors = 0
+        for file_path in self.python_files:
+            try:
+                with open(file_path, "r", encoding="utf-8") as handle:
+                    content = handle.read()
+                tree = ast.parse(content, filename=file_path)
+                imports: set[str] = set()
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        imports.update(alias.name for alias in node.names)
+                    elif isinstance(node, ast.ImportFrom) and node.module:
+                        imports.add(node.module)
+                self.imports_map[file_path] = sorted(imports)
+            except (SyntaxError, UnicodeDecodeError, OSError) as exc:
+                errors += 1
+                self.scan_issues.append({
+                    "kind": "syntax_or_parse_error",
+                    "file": os.path.relpath(file_path, self.base_dir),
+                    "detail": str(exc),
+                })
+        return errors
+
+    def _module_exists(self, module_name: str) -> bool:
+        parts = [p for p in module_name.split(".") if p]
+        if not parts or parts[0] not in self._IMPORT_ROOTS:
+            return True
+        base = os.path.join(self.base_dir, *parts)
+        return os.path.isfile(base + ".py") or os.path.isdir(base)
+
+    def _scan_internal_imports(self) -> int:
+        unresolved = 0
+        for file_path, imports in self.imports_map.items():
+            for module in imports:
+                root = module.split(".", 1)[0]
+                if root in self._IMPORT_ROOTS and not self._module_exists(module):
+                    unresolved += 1
+                    self.scan_issues.append({
+                        "kind": "unresolved_internal_import",
+                        "file": os.path.relpath(file_path, self.base_dir),
+                        "module": module,
+                    })
+        return unresolved
+
+    def _detect_duplicate_module_names(self) -> List[str]:
+        seen: Dict[str, str] = {}
+        duplicates: List[str] = []
+        for file_path in self.python_files:
+            rel = os.path.relpath(file_path, self.base_dir).replace(os.sep, "/")
+            module = rel[:-3].replace("/", ".")
+            if module.endswith(".__init__"):
+                module = module[:-9]
+            if module in seen:
+                duplicates.append(module)
+                self.scan_issues.append({
+                    "kind": "duplicate_module",
+                    "module": module,
+                    "files": [seen[module], rel],
+                })
+            else:
+                seen[module] = rel
+        return sorted(set(duplicates))
+
+    def _scan_source_risks(self) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        suspicious_calls = {"eval", "exec", "compile", "system", "popen", "setattr", "delattr"}
+        for file_path in self.python_files:
+            try:
+                content = open(file_path, "r", encoding="utf-8").read()
+                tree = ast.parse(content, filename=file_path)
+            except Exception:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    name = node.func.id if isinstance(node.func, ast.Name) else node.func.attr if isinstance(node.func, ast.Attribute) else ""
+                    if name in suspicious_calls:
+                        findings.append({
+                            "file": os.path.relpath(file_path, self.base_dir),
+                            "line": getattr(node, "lineno", None),
+                            "kind": "suspicious_call",
+                            "symbol": name,
+                        })
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    if node.module in {"subprocess", "ctypes", "pickle"}:
+                        findings.append({
+                            "file": os.path.relpath(file_path, self.base_dir),
+                            "line": getattr(node, "lineno", None),
+                            "kind": "sensitive_import",
+                            "module": node.module,
+                        })
+        return findings
+
+    def _scan_dependency_drift(self) -> List[Dict[str, Any]]:
+        """Compare imported third-party packages with declared requirement files when available."""
+        declared: set[str] = set()
+        for name in ("requirements.txt", "requirements-prod.txt", "requirements-dev.txt"):
+            path = os.path.join(self.base_dir, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                for line in open(path, "r", encoding="utf-8"):
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        declared.add(line.split("==")[0].split(">=")[0].split("<=")[0].strip().lower())
+            except OSError:
+                pass
+        stdlib = set(getattr(__import__("sys"), "stdlib_module_names", set()))
+        imported: set[str] = set()
+        for imports in self.imports_map.values():
+            imported.update(item.split(".")[0].lower() for item in imports)
+        findings = []
+        for module in sorted(imported):
+            if module in stdlib or module in {"typing_extensions"}:
+                continue
+            if declared and module not in declared and module not in {"fastapi", "pydantic", "aiohttp"}:
+                findings.append({"kind": "undeclared_import", "module": module})
+        return findings
+
+    def _detect_missing_modules(self) -> None:
+        missing_templates = {
+            "neural_compiler": ("compiler", "Advanced DSL compiler for game definition language not found", "god_brain/neural_compiler.py", "high", 8, ["ast", "types", "abc"]),
+            "consciousness_engine": ("agent", "NPC consciousness & emotional state engine missing", "god_brain/consciousness_engine.py", "high", 9, ["god_brain.agents.base_agent"]),
+            "performance_monitor": ("optimizer", "Real-time performance monitoring & optimization engine", "core/performance_monitor.py", "medium", 7, ["asyncio"]),
+        }
+        for module_id, (kind, reason, location, priority, complexity, deps) in missing_templates.items():
+            target = os.path.join(self.base_dir, location)
+            if not os.path.exists(target):
+                self.missing_modules.append(ModuleAnalysis(
+                    module_name=module_id,
+                    module_type=kind,
+                    reason=reason,
+                    priority=priority,
+                    suggested_location=location,
+                    estimated_complexity=complexity,
+                    dependencies=deps,
+                    confidence_score=0.98,
+                ))
 
 
 # ============================================================================
@@ -474,14 +545,19 @@ class AdvancedCodeGenerator:
         complexity = self._calculate_module_complexity(tree)
         
         # Create file path
-        file_path = os.path.join(
-            EvolutionConfig.BASE_DIR,
-            analysis.suggested_location
-        )
+        file_path = analysis.suggested_location.replace("\\", "/").lstrip("/")
+        repo_root = Path(EvolutionConfig.BASE_DIR).resolve()
+        candidate = (repo_root / file_path).resolve()
+        try:
+            candidate.relative_to(repo_root)
+        except ValueError as exc:
+            raise ValueError(f"Unsafe generated path: {analysis.suggested_location!r}") from exc
+        if not any(file_path == allowed or file_path.startswith(allowed + "/") for allowed in EvolutionConfig.ALLOWED_DIRS):
+            raise ValueError(f"Generated path outside evolution allowlist: {file_path}")
         
         return GeneratedModule(
             name=analysis.module_name,
-            file_path=file_path,
+            file_path=normalized,
             content=optimized_code,
             ast_tree=tree,
             validation_errors=issues,
@@ -980,10 +1056,17 @@ class GitHubAutomation:
         """Commit generated files to branch"""
         try:
             for file_path, content in files.items():
+                normalized = str(file_path).replace("\\", "/").lstrip("/")
+                if ".." in Path(normalized).parts or normalized.startswith((".", "/")):
+                    raise ValueError(f"Unsafe repository path: {file_path!r}")
+                if not any(normalized == allowed or normalized.startswith(allowed + "/") for allowed in EvolutionConfig.ALLOWED_DIRS):
+                    raise ValueError(f"Repository path outside evolution allowlist: {normalized}")
+                if not isinstance(content, str) or len(content.encode("utf-8")) > EvolutionConfig.MAX_FILE_SIZE_KB * 1024:
+                    raise ValueError(f"Generated file exceeds safety limit: {normalized}")
                 try:
-                    file_obj = self.repo.get_contents(file_path, ref=branch_name)
+                    file_obj = self.repo.get_contents(normalized, ref=branch_name)
                     self.repo.update_file(
-                        path=file_path,
+                        path=normalized,
                         message=commit_message,
                         content=content,
                         sha=file_obj.sha,
@@ -992,7 +1075,7 @@ class GitHubAutomation:
                     logger.info(f"✅ Updated: {file_path}")
                 except:
                     self.repo.create_file(
-                        path=file_path,
+                        path=normalized,
                         message=commit_message,
                         content=content,
                         branch=branch_name
@@ -1302,33 +1385,23 @@ class EvolutionEngine:
         return await self._engine.evolve_repository()
     
     async def scan_only(self) -> Tuple[List[ModuleAnalysis], Dict[str, Any]]:
-         """
+        """
         Scan repository without generation
         
         Returns:
             Tuple of missing modules and metrics
         """
-    return self._engine.scanner.scan_repository()
+        return self._engine.scanner.scan_repository()
 
     async def force_upgrade_system(self, files_dict: Dict[str, str], commit_message: str = "God Node Auto-Evolution Upgrade") -> Dict[str, Any]:
-        """Bypasses PR and directly pushes AI-generated code to the main branch."""
-        try:
-            logger.info(f"Initiating DIRECT system upgrade for {len(files_dict)} files...")
-            if not self._engine.github:
-                return {"status": "FAILED", "error": "GitHub credentials missing."}
-            
-            success = await self._engine.github.commit_files(
-                branch_name="main", 
-                files=files_dict, 
-                commit_message=commit_message
-            )
-            
-            if success:
-                return {"status": "SUCCESS", "message": "Code pushed successfully to GitHub 'main' branch."}
-            else:
-                return {"status": "FAILED", "error": "GitHub direct push failed."}
-        except Exception as e:
-            return {"status": "FAILED", "error": str(e)}
+        """Deprecated hard-stop: evolution can only create reviewable branches/PRs."""
+        logger.error("Direct main-branch evolution is disabled by policy.")
+        return {
+            "status": "REJECTED",
+            "error": "Direct pushes to main are disabled. Use evolve()/PR workflow for human review.",
+            "files_requested": len(files_dict) if isinstance(files_dict, dict) else 0,
+            "commit_message": commit_message,
+        }
         
    
 # ============================================================================
