@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import hmac
 import logging
 import os
 import re
@@ -42,12 +43,23 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
+from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Sequence
 
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
+
+try:
+    from core.game_project import (
+        BuildArtifact as CanonicalBuildArtifact,
+        BuildStatus as CanonicalBuildStatus,
+        GameProject,
+        ProjectStatus,
+        TargetPlatform,
+    )
+except Exception:
+    CanonicalBuildArtifact = CanonicalBuildStatus = GameProject = ProjectStatus = TargetPlatform = None
 
 
 # ============================================================================
@@ -103,6 +115,7 @@ SYSTEM_REGISTRY: dict[str, Any] = {}
 # In-memory project registry is intentionally bounded. The generated source bundle
 # is retained so /api/v2/export can build the exact project returned by orchestration.
 _generated_projects: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_project_aliases: dict[str, str] = {}
 _project_lock = asyncio.Lock()
 
 # Task registry is a bounded control-plane cache, not an unbounded history database.
@@ -204,33 +217,28 @@ async def _store_project(project: Mapping[str, Any]) -> None:
     if not _ID_RE.fullmatch(game_id) or not _ID_RE.fullmatch(build_id):
         raise ValueError("invalid generated project identity")
 
-    record = {
-        "game_id": game_id,
-        "build_id": build_id,
-        "stored_at": time.time(),
-        "updated_at": time.time(),
-        "build_config": dict(project.get("build_config") or {}),
-        "pipeline": project.get("pipeline"),
-        "qa": project.get("qa"),
-        "target_platform": project.get("target_platform"),
-        "metadata": project.get("project", {}).get("metadata", {})
-        if isinstance(project.get("project"), Mapping)
-        else {},
-    }
+    record = dict(project)
+    record["game_id"] = game_id
+    record["build_id"] = build_id
+    record["stored_at"] = time.time()
+    record["updated_at"] = time.time()
 
     async with _project_lock:
         await _purge_expired_locked(_generated_projects, ttl_seconds=CONFIG.project_ttl_seconds)
+        old = _generated_projects.pop(game_id, None)
+        if old is not None:
+            old_build_id = str(old.get("build_id") or "")
+            if old_build_id:
+                _project_aliases.pop(old_build_id, None)
         while len(_generated_projects) >= CONFIG.max_project_entries:
-            _generated_projects.popitem(last=False)
+            evicted_game_id, evicted = _generated_projects.popitem(last=False)
+            evicted_build_id = str(evicted.get("build_id") or "")
+            if evicted_build_id:
+                _project_aliases.pop(evicted_build_id, None)
+
         _generated_projects[game_id] = record
-        _generated_projects.move_to_end(game_id)
-        # build_id is an alias to the same bounded record by storing the alias only
-        # when it is not already occupied. This keeps the registry game-keyed and bounded.
-        if build_id != game_id:
-            _generated_projects[build_id] = record
-            _generated_projects.move_to_end(build_id)
-            while len(_generated_projects) > CONFIG.max_project_entries:
-                _generated_projects.popitem(last=False)
+        _project_aliases[build_id] = game_id
+
 
 
 def _validate_identity(value: str, name: str) -> str:
@@ -240,11 +248,20 @@ def _validate_identity(value: str, name: str) -> str:
     return value
 
 
+
 async def _get_project(identity: str) -> Optional[dict[str, Any]]:
     async with _project_lock:
         await _purge_expired_locked(_generated_projects, ttl_seconds=CONFIG.project_ttl_seconds)
-        record = _generated_projects.get(identity)
-        return dict(record) if record else None
+        game_id = identity if identity in _generated_projects else _project_aliases.get(identity)
+        record = _generated_projects.get(game_id) if game_id else None
+        if record is None:
+            if identity in _project_aliases:
+                _project_aliases.pop(identity, None)
+            return None
+        record = dict(record)
+        record["updated_at"] = time.time()
+        _generated_projects.move_to_end(game_id)
+        return record
 
 
 async def _track_runtime_task(task: asyncio.Task[Any]) -> None:
@@ -395,7 +412,7 @@ except Exception as exc:
 def _credential_is_valid(candidate: Optional[str]) -> bool:
     if not MASTER_PIN or not candidate:
         return False
-    return candidate == MASTER_PIN
+    return bool(hmac.compare_digest(str(candidate), MASTER_PIN))
 
 
 def _require_pin(candidate: Optional[str]) -> None:
@@ -509,6 +526,13 @@ async def lifespan(app: FastAPI):
                 with contextlib.suppress(Exception):
                     await call_maybe_async(shutdown)
 
+        for resource_name in ("orchestrator", "builder", "vault", "economy", "db_cloud", "odre_engine", "world_forge", "evolution"):
+            resource = SYSTEM_REGISTRY.get(resource_name)
+            shutdown = getattr(resource, "shutdown", None)
+            if shutdown is not None:
+                with contextlib.suppress(Exception):
+                    await call_maybe_async(shutdown)
+
         if connection_pool is not None:
             with contextlib.suppress(Exception):
                 await call_maybe_async(connection_pool.shutdown)
@@ -586,6 +610,75 @@ class WebRTCOfferPayload(BaseModel):
 
 
 # ============================================================================
+# CANONICAL PROJECT ADAPTERS
+# ============================================================================
+
+def _canonical_project_from_payload(payload: Mapping[str, Any]) -> Any:
+    if GameProject is None:
+        return None
+    project_data = payload.get("project")
+    if isinstance(project_data, Mapping):
+        try:
+            return GameProject.model_validate(project_data)
+        except Exception:
+            return None
+    return None
+
+
+def _canonicalize_build_result(project_payload: Mapping[str, Any], build_result: Mapping[str, Any]) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
+    updated = dict(project_payload)
+    project_obj = _canonical_project_from_payload(updated)
+    artifact = build_result.get("artifact")
+    canonical_artifact = None
+    if project_obj is not None and isinstance(artifact, Mapping):
+        try:
+            platform = {
+                "web": TargetPlatform.WEB_HTML5,
+                "mobile": TargetPlatform.MOBILE_APK,
+                "pc": TargetPlatform.PC_EXE,
+            }.get(str(artifact.get("target") or build_result.get("target_platform") or "web").lower(), project_obj.target_platform)
+            status = CanonicalBuildStatus.SUCCESS if str(build_result.get("status") or "").upper() == "SUCCESS" else CanonicalBuildStatus.FAILED
+            canonical_artifact = CanonicalBuildArtifact(
+                platform=platform,
+                status=status,
+                file_path=str(artifact.get("path")) if artifact.get("path") else None,
+                artifact_reference=str(artifact.get("path")) if artifact.get("path") else None,
+                file_size_bytes=int(artifact.get("size_bytes") or 0),
+                checksum=str(artifact.get("sha256")) if artifact.get("sha256") else None,
+                build_logs="\n".join(
+                    [str(x.get("stderr") or "") for x in (build_result.get("commands") or []) if isinstance(x, Mapping)]
+                ),
+            )
+            project_obj.add_build_artifact(canonical_artifact)
+            try:
+                project_obj.transition_to(ProjectStatus.COMPLETED)
+            except Exception:
+                try:
+                    project_obj.transition_to(ProjectStatus.BUILDING)
+                    project_obj.transition_to(ProjectStatus.COMPLETED)
+                except Exception:
+                    pass
+            updated["project"] = project_obj.model_dump(mode="json")
+            updated["canonical_contract"] = project_obj.snapshot_contract()
+        except Exception as exc:
+            updated.setdefault("warnings", []).append(f"canonical build artifact attachment failed: {type(exc).__name__}: {exc}")
+    return updated, canonical_artifact.model_dump(mode="json") if canonical_artifact is not None else None
+
+
+def _extract_task_error(result: Any) -> Optional[str]:
+    if not isinstance(result, Mapping):
+        return "Pipeline returned a non-mapping result"
+    for key in ("error", "message"):
+        value = result.get(key)
+        if value and not isinstance(value, (dict, list)):
+            return str(value)
+    errors = result.get("errors")
+    if isinstance(errors, Sequence) and not isinstance(errors, (str, bytes)) and errors:
+        return str(errors[0])
+    return None
+
+
+# ============================================================================
 # GENERATION / BUILD PIPELINE
 # ============================================================================
 
@@ -610,10 +703,16 @@ async def _execute_pipeline_task(
                 raise RuntimeError("Universal Builder offline")
 
             # 1. Intent/resource planning.
-            routing_plan = await call_maybe_async(
-                router.analyze_and_allocate,
-                directive,
-            )
+            routing_method = router.analyze_and_allocate
+            routing_kwargs = {"context_data": dict(context_data or {})}
+            try:
+                signature = inspect.signature(routing_method)
+                if "context_data" in signature.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values()):
+                    routing_plan = await call_maybe_async(routing_method, directive, **routing_kwargs)
+                else:
+                    routing_plan = await call_maybe_async(routing_method, directive)
+            except (TypeError, ValueError):
+                routing_plan = await call_maybe_async(routing_method, directive)
             if not isinstance(routing_plan, Mapping):
                 routing_plan = {"raw": routing_plan}
 
@@ -676,6 +775,12 @@ async def _execute_pipeline_task(
                 "pipeline": swarm_result.get("pipeline"),
                 "qa": swarm_result.get("qa"),
                 "project": swarm_result.get("project"),
+                "architecture": swarm_result.get("architecture"),
+                "assets": swarm_result.get("assets"),
+                "world": swarm_result.get("world"),
+                "physics": swarm_result.get("physics"),
+                "warnings": swarm_result.get("warnings") or [],
+                "canonical_contract": swarm_result.get("canonical_contract"),
             }
             await _store_project(project_record)
 
@@ -704,6 +809,11 @@ async def _execute_pipeline_task(
             status = str(build_result.get("status") or "FAILED").upper()
             success = status == "SUCCESS" and bool(build_result.get("artifact"))
 
+            enriched_project_record = dict(project_record)
+            enriched_project_record["updated_at"] = time.time()
+            enriched_project_record, canonical_artifact = _canonicalize_build_result(enriched_project_record, build_result)
+            await _store_project(enriched_project_record)
+
             final_payload = {
                 "routing_plan": dict(routing_plan),
                 "generation": {
@@ -714,6 +824,7 @@ async def _execute_pipeline_task(
                     "qa": swarm_result.get("qa"),
                 },
                 "build": dict(build_result),
+                "canonical_build_artifact": canonical_artifact,
             }
 
             await _set_task(
@@ -754,6 +865,18 @@ async def serve_control_panel() -> HTMLResponse:
         )
 
 
+def _service_health_snapshot() -> dict[str, str]:
+    snapshot: dict[str, str] = {}
+    critical = {"gateway", "orchestrator", "builder"}
+    for name in sorted(set(SYSTEM_REGISTRY) | critical):
+        snapshot[name] = "ONLINE" if SYSTEM_REGISTRY.get(name) is not None else "OFFLINE"
+    if not MASTER_PIN:
+        snapshot["auth"] = "NOT_CONFIGURED"
+    else:
+        snapshot["auth"] = "READY"
+    return snapshot
+
+
 @app.get("/api/v2/health")
 async def health() -> JSONResponse:
     registry_keys = sorted(SYSTEM_REGISTRY.keys())
@@ -764,6 +887,7 @@ async def health() -> JSONResponse:
             "version": app.version,
             "configured_master_credential": bool(MASTER_PIN),
             "services": registry_keys,
+            "service_health": _service_health_snapshot(),
             "limits": {
                 "max_concurrent_pipelines": CONFIG.max_concurrent_pipelines,
                 "max_concurrent_builds": CONFIG.max_concurrent_builds,
@@ -796,7 +920,8 @@ async def execute_command(payload: GodCommandPayload) -> JSONResponse:
 
 
 @app.get("/api/v2/status/{task_id}")
-async def check_status(task_id: str) -> JSONResponse:
+async def check_status(task_id: str, x_god_pin: Optional[str] = Header(default=None)) -> JSONResponse:
+    _require_pin(x_god_pin)
     task_id = _validate_identity(task_id, "task_id")
     task = await _get_task(task_id)
     if task is None:
@@ -852,6 +977,12 @@ async def trigger_universal_build(payload: BuildExportPayload) -> JSONResponse:
                 result = await call_maybe_async(builder.build_game, build_config)
                 status = str(result.get("status") if isinstance(result, Mapping) else "FAILED").upper()
                 success = status == "SUCCESS" and isinstance(result, Mapping) and bool(result.get("artifact"))
+                canonical_artifact = None
+                if isinstance(result, Mapping):
+                    updated_project, canonical_artifact = _canonicalize_build_result(project, result)
+                    await _store_project(updated_project)
+                    result = dict(result)
+                    result["canonical_build_artifact"] = canonical_artifact
                 await _set_task(
                     build_task_id,
                     status="SUCCESS" if success else status,
@@ -940,7 +1071,9 @@ async def _start_heartbeat(websocket: WebSocket) -> None:
         while True:
             await asyncio.sleep(CONFIG.heartbeat_seconds)
             await websocket.send_json({"type": "heartbeat", "ts": time.time()})
-    except (asyncio.CancelledError, Exception):
+    except asyncio.CancelledError:
+        return
+    except Exception:
         return
 
 
