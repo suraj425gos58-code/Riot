@@ -38,6 +38,24 @@ from dataclasses import asdict, dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional, Sequence
 
+from core.game_project import (
+    ArchitecturePlan,
+    AssetBlueprint as CanonicalAssetBlueprint,
+    AssetRequest as CanonicalAssetRequest,
+    AssetType as CanonicalAssetType,
+    AssetGenerationStatus as CanonicalAssetGenerationStatus,
+    GameplayModule,
+    GameplayModuleType,
+    GameProject,
+    PhysicsConfig,
+    ProjectStatus,
+    QAReport,
+    QAStatus,
+    RuntimeType,
+    WorldManifest,
+    ChunkManifest,
+)
+
 try:
     from god_brain.voice_engine import VoiceEngine, VoiceFormat, VoiceProfile, VoiceSynthesisRequest, VoiceTaskType
 except Exception:
@@ -150,45 +168,6 @@ class BinarySourceFile:
 
     def size_bytes(self) -> int:
         return len(self.content)
-
-
-@dataclass(slots=True)
-class GeneratedProject:
-    game_id: str
-    build_id: str
-    prompt: str
-    target_platform: str
-    architecture: Any
-    assets: list[Any]
-    world: list[Any]
-    physics: Any
-    gameplay: list[Any]
-    source_files: list[SourceFile]
-    binary_files: list[BinarySourceFile] = field(default_factory=list)
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    def to_builder_config(self) -> dict[str, Any]:
-        files: dict[str, Any] = {
-            item.path: item.content
-            for item in self.source_files
-        }
-        files.update({item.path: item.content for item in self.binary_files})
-        return {
-            "game_id": self.game_id,
-            "build_id": self.build_id,
-            "target_platform": self.target_platform,
-            "source_bundle": {
-                "files": files,
-                "manifest": {
-                    "schema": "riot.project.v2",
-                    "game_id": self.game_id,
-                    "build_id": self.build_id,
-                    "target_platform": self.target_platform,
-                    "file_count": len(files),
-                },
-            },
-            "metadata": self.metadata,
-        }
 
 
 @dataclass(slots=True)
@@ -444,6 +423,200 @@ def _validate_binary_sources(files: Sequence[BinarySourceFile], max_bytes: int, 
         if total > max_bytes:
             raise ValueError(f"generated binary assets exceed {max_bytes} byte orchestration limit")
 
+
+
+# ============================================================================
+# CANONICAL GAME PROJECT ADAPTER
+# ============================================================================
+
+_TARGET_RUNTIME = {
+    "web": RuntimeType.WEB,
+    "mobile": RuntimeType.NATIVE_MOBILE,
+    "pc": RuntimeType.DESKTOP,
+    "cloud_stream": RuntimeType.CLOUD_STREAM,
+}
+
+_ASSET_TYPE_ALIASES = {
+    "model": CanonicalAssetType.MODEL_3D,
+    "3d_model": CanonicalAssetType.MODEL_3D,
+    "3d": CanonicalAssetType.MODEL_3D,
+    "mesh": CanonicalAssetType.MODEL_3D,
+    "2d": CanonicalAssetType.MODEL_2D,
+    "image": CanonicalAssetType.TEXTURE,
+    "audio": CanonicalAssetType.SOUND,
+    "sfx": CanonicalAssetType.SOUND,
+    "vocal": CanonicalAssetType.VOICE,
+}
+
+
+def _canonical_asset_type(value: Any) -> CanonicalAssetType:
+    raw = str(value or "procedural").strip().lower()
+    try:
+        return CanonicalAssetType(raw)
+    except ValueError:
+        return _ASSET_TYPE_ALIASES.get(raw, CanonicalAssetType.PROCEDURAL)
+
+
+def _project_transition(project: GameProject, status: ProjectStatus) -> None:
+    """Advance the canonical lifecycle without bypassing its state machine."""
+    if project.status == status:
+        return
+    project.transition_to(status)
+
+
+def _register_canonical_assets(
+    project: GameProject,
+    assets: Sequence[Any],
+) -> None:
+    """Convert agent asset specifications into canonical dependency-linked records."""
+    for index, raw in enumerate(assets):
+        if not isinstance(raw, Mapping):
+            continue
+        asset_id = str(raw.get("asset_id") or raw.get("id") or _stable_id("asset", index, raw))
+        name = str(raw.get("name") or raw.get("title") or f"Generated Asset {index + 1}")[:256]
+        asset_type = _canonical_asset_type(raw.get("asset_type") or raw.get("type") or raw.get("kind"))
+        request_id = f"assetreq_{asset_id}"
+        blueprint_id = f"blueprint_{asset_id}"
+        prompt_text = str(raw.get("prompt") or raw.get("description") or name)
+
+        if request_id not in project.asset_requests:
+            project.add_asset_request(CanonicalAssetRequest(
+                request_id=request_id,
+                asset_type=asset_type,
+                name=name,
+                prompt=prompt_text,
+                priority=int(raw.get("priority", 50) or 50),
+                required_for_world=bool(raw.get("required_for_world", True)),
+                target_formats=[str(x) for x in (raw.get("formats") or raw.get("target_formats") or []) if x],
+                requirements=_json_safe(dict(raw.get("requirements") or {})) if isinstance(raw.get("requirements"), Mapping) else {},
+                metadata={"agent_spec": _json_safe(raw)},
+            ))
+        if blueprint_id not in project.asset_blueprints:
+            project.add_asset_blueprint(CanonicalAssetBlueprint(
+                blueprint_id=blueprint_id,
+                request_id=request_id,
+                asset_type=asset_type,
+                name=name,
+                generation_strategy=str(raw.get("generation_strategy") or raw.get("strategy") or "agent_spec"),
+                specification=_json_safe(dict(raw)),
+                expected_formats=[str(x) for x in (raw.get("formats") or raw.get("target_formats") or []) if x],
+                dependencies=[str(x) for x in (raw.get("dependencies") or []) if x],
+            ))
+
+        source_path = raw.get("source_path") or raw.get("path")
+        artifact_reference = raw.get("artifact_reference") or raw.get("external_uri") or raw.get("uri")
+        # A specification without a real artifact is PLANNED, never falsely GENERATED.
+        status = (
+            CanonicalAssetGenerationStatus.GENERATED
+            if source_path or artifact_reference
+            else CanonicalAssetGenerationStatus.PLANNED
+        )
+        try:
+            project.register_asset_reference(
+                request_id=request_id,
+                blueprint_id=blueprint_id,
+                asset_id=asset_id,
+                asset_type=asset_type,
+                name=name,
+                source_path=str(source_path) if source_path else None,
+                artifact_reference=str(artifact_reference) if artifact_reference else None,
+                status=status,
+                checksum=str(raw.get("checksum")) if raw.get("checksum") else None,
+                format=str(raw.get("format")) if raw.get("format") else None,
+                size_bytes=max(0, int(raw.get("size_bytes", 0) or 0)),
+                metadata={"agent_spec": _json_safe(raw)},
+            )
+        except ValueError as exc:
+            # Preserve the original spec as metadata rather than aborting the whole run.
+            project.add_warning(f"asset canonicalization skipped {asset_id}: {type(exc).__name__}: {exc}")
+            project.metadata.setdefault("asset_canonicalization_errors", []).append({
+                "asset_id": asset_id,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+
+def _register_canonical_world(
+    project: GameProject,
+    world: Sequence[Any],
+    assets: Sequence[Any],
+) -> None:
+    """Persist world output as a typed manifest while retaining full raw sector evidence."""
+    manifest = WorldManifest(
+        name=f"{project.name} World"[:256],
+        seed=project.seed,
+        metadata={
+            "schema": "riot.orchestrator.world.v2",
+            "sector_count": len(world),
+            "raw_sectors": _json_safe(list(world)),
+        },
+    )
+    known_asset_ids = {
+        str(item.get("id") or item.get("asset_id"))
+        for item in assets
+        if isinstance(item, Mapping) and (item.get("id") or item.get("asset_id"))
+    }
+    for index, raw in enumerate(world):
+        if not isinstance(raw, Mapping):
+            raw = {"value": _json_safe(raw)}
+        chunk_id = str(raw.get("chunk_id") or raw.get("sector_id") or raw.get("id") or _stable_id("chunk", index, raw))
+        placement_ids = raw.get("asset_ids") or raw.get("assets") or raw.get("asset_refs") or []
+        placements = []
+        if isinstance(placement_ids, (list, tuple)):
+            for asset_ref in placement_ids:
+                if isinstance(asset_ref, Mapping):
+                    ref = asset_ref.get("asset_id") or asset_ref.get("id")
+                else:
+                    ref = asset_ref
+                if ref and str(ref) in known_asset_ids and str(ref) in project.asset_manifest.assets:
+                    from core.game_project import AssetPlacement
+                    placements.append(AssetPlacement(asset_id=str(ref), properties={"source": "agent_world"}))
+        manifest.chunks[chunk_id] = ChunkManifest(
+            chunk_id=chunk_id,
+            asset_placements=placements,
+            metadata={"raw_sector": _json_safe(raw)},
+        )
+        for placement in placements:
+            manifest.used_asset_ids.add(placement.asset_id)
+    project.world_manifest = manifest
+
+
+def _canonical_physics(value: Any) -> Optional[PhysicsConfig]:
+    if isinstance(value, Mapping):
+        try:
+            return PhysicsConfig.model_validate(value)
+        except Exception:
+            return None
+    return None
+
+
+def _canonical_qa(value: Any, tested_files: Sequence[str]) -> QAReport:
+    if isinstance(value, Mapping):
+        try:
+            report = QAReport.model_validate(value)
+            if not report.tested_files:
+                report.tested_files = list(tested_files)
+            return report
+        except Exception:
+            status_raw = str(value.get("status") or value.get("result") or "PARTIAL").upper()
+            status = QAStatus.PASSED if status_raw in {"PASS", "PASSED", "OK", "SUCCESS"} else QAStatus.PARTIAL
+            return QAReport(
+                status=status,
+                tests_run=max(1, int(value.get("tests_run", 1) or 1)),
+                tests_passed=max(0, int(value.get("tests_passed", 1 if status == QAStatus.PASSED else 0) or 0)),
+                tests_failed=max(0, int(value.get("tests_failed", 0 if status == QAStatus.PASSED else 1) or 0)),
+                issues=[str(x) for x in (value.get("issues") or [])],
+                warnings=[str(x) for x in (value.get("warnings") or [])],
+                tested_files=list(tested_files),
+                checks={},
+            )
+    return QAReport(
+        status=QAStatus.PARTIAL,
+        tests_run=1,
+        tests_passed=0,
+        tests_failed=1,
+        issues=["QA agent did not return a structured report"],
+        tested_files=list(tested_files),
+    )
 
 # ============================================================================
 # AGENT INVOCATION
@@ -994,23 +1167,22 @@ requestAnimationFrame(tick);
     async def _qa(
         self,
         state: PipelineState,
-        project: GeneratedProject,
+        project: GameProject,
     ) -> AgentResult:
         state.transition(PipelineStage.QA)
 
         source_payload = {
-            "game_id": project.game_id,
-            "build_id": project.build_id,
-            "target_platform": project.target_platform,
+            "project": project.summary(),
+            "source_bundle": project.source_bundle.source_manifest(),
             "source_files": [
-                {"path": item.path, "content": item.content}
-                for item in project.source_files
+                {"path": path, "content": item.content}
+                for path, item in project.source_bundle.files.items()
             ],
-            "architecture": _json_safe(project.architecture),
-            "assets": _json_safe(project.assets),
-            "world": _json_safe(project.world),
-            "physics": _json_safe(project.physics),
-            "gameplay": _json_safe(project.gameplay),
+            "architecture": _json_safe(project.architecture_plan),
+            "assets": _json_safe(project.asset_manifest.assets),
+            "world": _json_safe(project.world_manifest),
+            "physics": _json_safe(project.physics_config),
+            "gameplay": _json_safe(project.gameplay_modules),
         }
 
         result = await self._run_agent(
@@ -1173,37 +1345,87 @@ requestAnimationFrame(tick);
                     }, ensure_ascii=False, indent=2),
                 ))
 
-                project = GeneratedProject(
-                    game_id=state.game_id,
+                # ---------------------------------------------------------
+                # 6. CANONICAL PROJECT ASSEMBLY
+                # ---------------------------------------------------------
+                project_target = {
+                    "web": "web_html5",
+                    "mobile": "mobile_apk",
+                    "pc": "pc_exe",
+                }[state.target_platform]
+                project = GameProject(
+                    project_id=state.game_id,
                     build_id=state.build_id,
-                    prompt=state.prompt,
-                    target_platform=state.target_platform,
-                    architecture=plan,
-                    assets=assets,
-                    world=world,
-                    physics=physics,
-                    gameplay=[],
-                    source_files=source_files,
-                    binary_files=voice_binary_files,
+                    name=str((plan.get("name") if isinstance(plan, Mapping) else None) or "Riot Generated Game")[:256],
+                    description=str((plan.get("description") if isinstance(plan, Mapping) else None) or state.prompt)[:2000],
+                    user_prompt=state.prompt,
+                    target_platform=project_target,
+                    runtime_type=_TARGET_RUNTIME.get(state.target_platform),
+                    seed=int(hashlib.sha256(state.prompt.encode("utf-8")).hexdigest()[:12], 16),
                     metadata={
-                        "pipeline_schema": "riot.orchestrator.v2",
-                        "asset_count": len(assets),
-                        "world_sector_count": len(world),
-                        "source_file_count": len(source_files),
-                        "voice_asset_count": len(voice_manifest),
-                        "voice_assets": voice_manifest,
+                        "pipeline_schema": "riot.orchestrator.v3",
+                        "orchestrator_build_id": state.build_id,
+                        "agent_count": agent_count,
+                        "raw_plan": _json_safe(plan),
+                        "raw_assets": _json_safe(assets),
+                        "raw_world": _json_safe(world),
+                        "raw_physics": _json_safe(physics),
+                        "voice_assets": _json_safe(voice_manifest),
                     },
                 )
 
-                _validate_sources(
-                    project.source_files,
-                    self.config.max_source_bytes,
+                # The canonical state machine is advanced in-order.
+                _project_transition(project, ProjectStatus.ROUTING)
+                _project_transition(project, ProjectStatus.PLANNING)
+                project.architecture_plan = ArchitecturePlan(
+                    target_platform=project.target_platform,
+                    game_genre=str(plan.get("game_genre") or plan.get("genre") or "unknown") if isinstance(plan, Mapping) else "unknown",
+                    visual_style=str(plan.get("visual_style") or plan.get("style") or "unknown") if isinstance(plan, Mapping) else "unknown",
+                    complexity_class=str(plan.get("complexity_class") or "generated") if isinstance(plan, Mapping) else "generated",
+                    core_gameplay_loop=str(plan.get("core_gameplay_loop")) if isinstance(plan, Mapping) and plan.get("core_gameplay_loop") else None,
+                    engine_config=_json_safe(dict(plan.get("engine_config") or {})) if isinstance(plan, Mapping) and isinstance(plan.get("engine_config"), Mapping) else {},
+                    required_agents=[str(x) for x in (plan.get("required_agents") or [])] if isinstance(plan, Mapping) and isinstance(plan.get("required_agents"), (list, tuple)) else [],
+                    required_capabilities={str(x) for x in (plan.get("required_capabilities") or [])} if isinstance(plan, Mapping) and isinstance(plan.get("required_capabilities"), (list, tuple, set)) else set(),
+                    build_steps=[str(x) for x in (plan.get("build_steps") or [])] if isinstance(plan, Mapping) and isinstance(plan.get("build_steps"), (list, tuple)) else [],
+                    technical_constraints=[str(x) for x in (plan.get("technical_constraints") or [])] if isinstance(plan, Mapping) and isinstance(plan.get("technical_constraints"), (list, tuple)) else [],
                 )
-                _validate_binary_sources(
-                    project.binary_files,
-                    self.config.max_source_bytes,
-                    {item.path for item in project.source_files},
+                _project_transition(project, ProjectStatus.ASSET_PLANNING)
+                _register_canonical_assets(project, assets)
+                _project_transition(project, ProjectStatus.ASSET_GENERATION)
+                _project_transition(project, ProjectStatus.WORLD_GENERATION)
+                _register_canonical_world(project, world, assets)
+                _project_transition(project, ProjectStatus.SCENE_GENERATION)
+                _project_transition(project, ProjectStatus.PHYSICS_CONFIG)
+                canonical_physics = _canonical_physics(physics)
+                if canonical_physics is not None:
+                    project.physics_config = canonical_physics
+                else:
+                    project.add_warning("physics agent output could not be represented by canonical PhysicsConfig; raw output retained in metadata")
+                _project_transition(project, ProjectStatus.GAMEPLAY_GENERATION)
+                gameplay_module = GameplayModule(
+                    name="Generated Runtime",
+                    module_type=GameplayModuleType.CUSTOM,
+                    configuration={"schema": "riot.runtime.generated.v1"},
+                    source_files=["game.js", "runtime-model.json", "game-manifest.json"],
                 )
+                project.add_gameplay_module(gameplay_module)
+                _project_transition(project, ProjectStatus.SOURCE_GENERATION)
+                project.register_source_files(
+                    {item.path: item.content for item in source_files},
+                    entry_point="index.html",
+                )
+                for binary in voice_binary_files:
+                    project.register_binary_file(
+                        binary.path,
+                        bytes(binary.content),
+                        media_type=f"audio/{PurePosixPath(binary.path).suffix.lstrip('.')}",
+                    )
+                project.register_voice_artifacts(voice_artifacts)
+                project.audio_manifest.metadata["voice_manifest"] = _json_safe(voice_manifest)
+                project.metadata["source_bundle"] = project.source_bundle.source_manifest()
+
+                project.validate_source_bundle()
+                project.validate_pipeline_integrity()
 
                 # ---------------------------------------------------------
                 # 6. QA
@@ -1211,28 +1433,25 @@ requestAnimationFrame(tick);
                 if self.config.require_qa:
                     qa_result = await self._qa(state, project)
                     if not qa_result.ok:
-                        raise RuntimeError(
-                            qa_result.error or "QA agent failed"
-                        )
+                        raise RuntimeError(qa_result.error or "QA agent failed")
                     qa_payload = _extract_agent_payload(qa_result.result)
+                    project.qa_report = _canonical_qa(qa_payload, list(project.source_bundle.files.keys()))
                 else:
                     qa_payload = {"status": "SKIPPED"}
+                    project.qa_report = QAReport(status=QAStatus.NOT_TESTED, tested_files=list(project.source_bundle.files.keys()))
 
-                # QA can return a rejection, but absence of a standardized
-                # schema should not be mistaken for failure.
-                if isinstance(qa_payload, Mapping):
-                    qa_status = str(
-                        qa_payload.get("status")
-                        or qa_payload.get("result")
-                        or ""
-                    ).upper()
-                    if qa_status in {"FAILED", "FAIL", "REJECTED", "UNSAFE"}:
-                        raise RuntimeError(
-                            f"QA rejected generated project: {json.dumps(_json_safe(qa_payload))}"
-                        )
+                qa_status = project.qa_report.status
+                if qa_status in {QAStatus.FAILED} or (isinstance(qa_payload, Mapping) and str(qa_payload.get("status") or "").upper() in {"REJECTED", "UNSAFE"}):
+                    raise RuntimeError(f"QA rejected generated project: {json.dumps(_json_safe(qa_payload))}")
+
+                project.validate_for_build(require_qa=self.config.require_qa)
+                _project_transition(project, ProjectStatus.QA_TESTING)
+                qa_stage = project.pipeline_stages.get(ProjectStatus.QA_TESTING.value)
+                if qa_stage is not None and qa_stage.status.value == "RUNNING":
+                    project.complete_stage(ProjectStatus.QA_TESTING, success=True)
+                _project_transition(project, ProjectStatus.READY_FOR_BUILD)
 
                 state.transition(PipelineStage.ASSEMBLY)
-
                 builder_config = project.to_builder_config()
                 state.transition(PipelineStage.COMPLETE)
 
@@ -1240,25 +1459,21 @@ requestAnimationFrame(tick);
 
                 return {
                     "status": "SUCCESS",
-                    "message": "Game project generated, assembled, and QA-checked.",
+                    "message": "Game project generated, canonically assembled, and QA-checked.",
                     "execution_time": f"{duration_ms / 1000.0:.2f}s",
-                    "game_id": project.game_id,
+                    "game_id": project.project_id,
                     "build_id": project.build_id,
-                    "target_platform": project.target_platform,
-                    "project": {
-                        "game_id": project.game_id,
-                        "build_id": project.build_id,
-                        "source_bundle": builder_config["source_bundle"],
-                        "metadata": project.metadata,
-                    },
+                    "target_platform": project.target_platform.value,
+                    "project": project.model_dump(mode="json"),
                     "build_config": builder_config,
-                    "architecture": _json_safe(project.architecture),
-                    "assets": _json_safe(project.assets),
-                    "world": _json_safe(project.world),
-                    "physics": _json_safe(project.physics),
-                    "qa": _json_safe(qa_payload),
+                    "architecture": _json_safe(project.architecture_plan),
+                    "assets": _json_safe(project.asset_manifest.assets),
+                    "world": _json_safe(project.world_manifest),
+                    "physics": _json_safe(project.physics_config),
+                    "qa": _json_safe(project.qa_report),
                     "pipeline": state.to_dict(),
-                    "warnings": state.warnings,
+                    "warnings": list(state.warnings) + list(project.warnings),
+                    "canonical_contract": project.snapshot_contract(),
                 }
 
         except asyncio.TimeoutError:
@@ -1345,7 +1560,6 @@ async def generate_full_game_with_swarm(
 
 __all__ = [
     "AgentResult",
-    "GeneratedProject",
     "GodOrchestrator",
     "OrchestratorConfig",
     "PipelineStage",
