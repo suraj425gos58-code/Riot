@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import copy
 import json
 import logging
 import os
@@ -138,6 +139,7 @@ class OrchestratorConfig:
     enable_voice: bool = True
     max_voice_lines: int = DEFAULT_MAX_VOICE_LINES
     voice_concurrency: int = DEFAULT_VOICE_CONCURRENCY
+    allow_legacy_gameplay_fallback: bool = True
 
 
 @dataclass(slots=True)
@@ -176,6 +178,7 @@ class PipelineState:
     game_id: str
     prompt: str
     target_platform: str
+    context_data: dict[str, Any] = field(default_factory=dict)
     stage: str = PipelineStage.PLANNING
     started_at: float = field(default_factory=time.time)
     stage_started_at: float = field(default_factory=time.time)
@@ -196,6 +199,7 @@ class PipelineState:
             "game_id": self.game_id,
             "prompt": self.prompt,
             "target_platform": self.target_platform,
+            "context_data": _json_safe(self.context_data),
             "stage": self.stage,
             "started_at": self.started_at,
             "duration_ms": max(0.0, (time.time() - self.started_at) * 1000.0),
@@ -311,6 +315,35 @@ def _extract_agent_payload(value: Any) -> Any:
                 if candidate is not value:
                     return _extract_agent_payload(candidate)
     return value
+
+
+def _extract_plan_payload(value: Any) -> Any:
+    """Normalize the Director v5 envelope without discarding architecture data."""
+    current = _extract_agent_payload(value)
+    if isinstance(current, Mapping):
+        architecture = current.get("architecture")
+        if isinstance(architecture, Mapping):
+            merged = dict(architecture)
+            planner_summary = current.get("planner_summary")
+            if isinstance(planner_summary, Mapping):
+                merged["planner_summary"] = _json_safe(planner_summary)
+            for key in ("assumptions", "unresolved_decisions"):
+                if key in current and key not in merged:
+                    merged[key] = _json_safe(current[key])
+            return merged
+    return current
+
+
+def _call_supported_kwargs(method: Callable[..., Any], kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop unsupported optional kwargs without masking real execution errors."""
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        return dict(kwargs)
+    parameters = signature.parameters
+    if any(param.kind is inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+        return dict(kwargs)
+    return {key: value for key, value in kwargs.items() if key in parameters}
 
 
 def _normalize_source_files(value: Any) -> list[SourceFile]:
@@ -662,10 +695,12 @@ class GodOrchestrator:
         self,
         *,
         config: Optional[OrchestratorConfig] = None,
+        gateway: Any = None,
         director: Any = None,
         asset_gen: Any = None,
         map_builder: Any = None,
         physics: Any = None,
+        gameplay_agent: Any = None,
         qa_tester: Any = None,
         voice_engine: Any = None,
     ) -> None:
@@ -676,11 +711,28 @@ class GodOrchestrator:
         from god_brain.agents.qa_tester_agent import QATesterAgent
 
         self.config = config or OrchestratorConfig()
+        self.gateway = gateway
 
         self.director = director or DirectorAgent()
         self.asset_gen = asset_gen or AssetGeneratorAgent()
         self.map_builder = map_builder or MapBuilderAgent()
         self.physics = physics or PhysicsAgent()
+
+        # GameplayAgent is intentionally optional until its specialist module is
+        # installed. Once present, the orchestrator uses it as the authoritative
+        # gameplay/source producer rather than silently replacing it with a demo.
+        if gameplay_agent is not None:
+            self.gameplay_agent = gameplay_agent
+        else:
+            try:
+                from god_brain.agents.gameplay_agent import GameplayAgent
+                self.gameplay_agent = GameplayAgent()
+            except (ImportError, ModuleNotFoundError):
+                self.gameplay_agent = None
+            except Exception:
+                logger.exception("GameplayAgent import failed; legacy source fallback remains available")
+                self.gameplay_agent = None
+
         self.qa_tester = qa_tester or QATesterAgent()
         if voice_engine is not None:
             self.voice_engine = voice_engine
@@ -690,14 +742,30 @@ class GodOrchestrator:
             self.voice_engine = None
 
         self.semaphore = asyncio.Semaphore(self.config.max_concurrent_agents)
-
         self._active_pipeline: dict[str, asyncio.Task[Any]] = {}
         self._registry_lock = asyncio.Lock()
 
+        # Use the application gateway when supplied, and propagate it to every
+        # BaseAgent without depending on subclass constructor signatures.
+        if self.gateway is not None:
+            for agent in (
+                self.director,
+                self.asset_gen,
+                self.map_builder,
+                self.physics,
+                self.gameplay_agent,
+                self.qa_tester,
+            ):
+                setter = getattr(agent, "set_gateway", None)
+                if callable(setter):
+                    setter(self.gateway)
+
         logger.info(
-            "GodOrchestrator ready: concurrency=%d timeout=%ss",
+            "GodOrchestrator ready: concurrency=%d timeout=%ss gateway=%s gameplay_agent=%s",
             self.config.max_concurrent_agents,
             self.config.operation_timeout_seconds,
+            self.gateway is not None,
+            self.gameplay_agent is not None,
         )
 
     # ---------------------------------------------------------------------
@@ -739,24 +807,35 @@ class GodOrchestrator:
             or type(agent).__name__
         )
         started = time.perf_counter()
+        call_kwargs = _call_supported_kwargs(method, kwargs or {})
 
+        # The semaphore belongs to the orchestration boundary. Provider retry,
+        # circuit state and failover remain below this layer.
         async with self.semaphore:
             try:
-                call_kwargs = kwargs or {}
-                if task_data is None:
-                    value = await self._resolve_agent_call(method, **call_kwargs)
-                else:
-                    value = await self._resolve_agent_call(
-                        method, task_data, **call_kwargs
-                    )
+                value = await self._resolve_agent_call(
+                    method,
+                    *(() if task_data is None else (task_data,)),
+                    **call_kwargs,
+                )
 
                 elapsed = (time.perf_counter() - started) * 1000.0
+                payload = _extract_agent_payload(value)
+                metadata: dict[str, Any] = {
+                    "agent_contract": str(getattr(agent, "agent_version", "legacy")),
+                }
+                if isinstance(value, Mapping):
+                    runtime_meta = value.get("_agent_runtime") or value.get("metadata")
+                    if isinstance(runtime_meta, Mapping):
+                        metadata.update(_json_safe(runtime_meta))
+
                 return AgentResult(
                     task_id=task_id,
                     role=role,
                     ok=True,
-                    result=_extract_agent_payload(value),
+                    result=payload,
                     duration_ms=elapsed,
+                    metadata=metadata,
                 )
             except asyncio.CancelledError:
                 raise
@@ -805,12 +884,38 @@ class GodOrchestrator:
             task_id="director",
             agent=self.director,
             task_data=state.prompt,
-            kwargs={},
+            kwargs={
+                "context": state.context_data,
+                "target_platform": state.target_platform,
+            },
         )
         state.add_result(result)
 
         if not result.ok or result.result is None:
             state.errors.append(result.error or "director returned no plan")
+            return result
+
+        result.result = _extract_plan_payload(result.result)
+        # The Director's architecture projection is authoritative for platform
+        # and identity; never read them from a transport wrapper.
+        plan = result.result
+        if isinstance(plan, Mapping):
+            requested_game_id = plan.get("game_id") or plan.get("project_id") or plan.get("id")
+            if requested_game_id:
+                try:
+                    state.game_id = _safe_game_id(requested_game_id)
+                except ValueError as exc:
+                    state.errors.append(str(exc))
+                    result.ok = False
+                    result.error = str(exc)
+            requested_target = plan.get("target_platform") or plan.get("platform")
+            if requested_target:
+                try:
+                    state.target_platform = _safe_target(requested_target)
+                except ValueError as exc:
+                    state.errors.append(str(exc))
+                    result.ok = False
+                    result.error = str(exc)
         return result
 
     async def _generate_assets_and_world(
@@ -819,98 +924,170 @@ class GodOrchestrator:
         plan: Any,
         agent_count: int,
     ) -> tuple[list[AgentResult], list[AgentResult]]:
+        """
+        Asset/world execution graph.
+
+        Phase A: generate asset requirements in parallel.
+        Phase B: feed the *real returned asset specifications* to world agents.
+
+        The previous implementation launched world jobs with an empty asset list
+        and then performed another enrichment round. That doubled world calls and
+        made the dependency graph ambiguous. This version establishes the actual
+        dependency boundary once and preserves the generated asset contracts.
+        """
         state.transition(PipelineStage.ASSETS)
+        requested = max(1, int(agent_count))
 
-        total = max(2, min(int(agent_count), self.config.max_assets))
-        asset_count = max(1, int(total * 0.65))
-        map_count = max(1, total - asset_count)
-        map_count = min(map_count, self.config.max_map_sectors)
+        # Prefer the Director's explicit asset work packages/asset requirements.
+        plan_assets: list[Any] = []
+        if isinstance(plan, Mapping):
+            candidate = plan.get("assets")
+            if isinstance(candidate, list):
+                plan_assets = candidate
+            elif isinstance(plan.get("planner_summary"), Mapping):
+                candidate = plan["planner_summary"].get("assets")
+                if isinstance(candidate, list):
+                    plan_assets = candidate
 
-        asset_jobs = [
-            (
-                f"asset_{index:04d}",
-                self.asset_gen,
-                (
-                    f"Generate asset specification {index + 1} for this game. "
-                    "Return structured asset data suitable for a real project "
-                    "manifest; do not return placeholder text.\n"
-                    f"Prompt: {state.prompt}\nPlan: {json.dumps(_json_safe(plan), default=str)}"
-                ),
-                {
-                    "style": "optimized",
-                    "project_context": _compact_prompt_context(state.prompt, plan),
-                },
-            )
-            for index in range(asset_count)
-        ]
-
-        # World generation gets the plan, not a fabricated asset list.
-        world_jobs = [
-            (
-                f"world_{index:04d}",
-                self.map_builder,
-                (
-                    f"Generate world sector specification {index + 1}. "
-                    "Use the supplied plan. Reference real asset IDs/specifications "
-                    "when they exist; do not invent a placeholder_list."
-                ),
-                {
-                    "generated_assets": [],
-                    "game_plan": _json_safe(plan),
-                    "prompt": state.prompt,
-                    "sector_index": index,
-                },
-            )
-            for index in range(map_count)
-        ]
-
-        # These two families are independent at this stage. The world builder can
-        # produce symbolic references and receives real assets in a second pass
-        # below when possible.
-        asset_results, world_results = await asyncio.gather(
-            self._run_parallel(asset_jobs),
-            self._run_parallel(world_jobs),
+        asset_count = min(
+            self.config.max_assets,
+            max(1, min(requested, len(plan_assets) if plan_assets else max(1, int(requested * 0.65)))),
+        )
+        map_count = min(
+            self.config.max_map_sectors,
+            max(1, requested - asset_count),
         )
 
-        for result in (*asset_results, *world_results):
+        asset_jobs: list[tuple[str, Any, Any, dict[str, Any]]] = []
+        for index in range(asset_count):
+            requirement = plan_assets[index] if index < len(plan_assets) else None
+            requirement_text = json.dumps(_json_safe(requirement), ensure_ascii=False, separators=(",", ":")) if requirement is not None else f"asset requirement slot {index + 1}"
+            asset_jobs.append(
+                (
+                    f"asset_{index:04d}",
+                    self.asset_gen,
+                    (
+                        "Produce one detailed asset specification for the supplied game architecture. "
+                        "Return structured data only. Do not claim the binary asset already exists.\n"
+                        f"ASSET REQUIREMENT: {requirement_text}\n"
+                        f"GAME PROMPT: {state.prompt}"
+                    ),
+                    {
+                        "style": "realistic-production",
+                        "project_context": {
+                            "build_id": state.build_id,
+                            "game_id": state.game_id,
+                            "target_platform": state.target_platform,
+                            "plan": _json_safe(plan),
+                            "requirement": _json_safe(requirement),
+                        },
+                    },
+                )
+            )
+
+        asset_results = await self._run_parallel(asset_jobs)
+        for result in asset_results:
             state.add_result(result)
 
-        successful_assets = [
-            item for result in asset_results if result.ok
-            for item in _normalize_collection(
-                result.result, item_prefix=result.task_id, limit=1
-            )
-        ]
+        real_assets: list[Any] = []
+        for result in asset_results:
+            if result.ok:
+                real_assets.extend(
+                    _normalize_collection(
+                        result.result,
+                        item_prefix=result.task_id,
+                        limit=1,
+                    )
+                )
+        real_assets = real_assets[: self.config.max_assets]
 
-        # Second-pass enrichment: give successful asset manifests to map jobs
-        # without performing another map call when the first pass already
-        # returned enough structural data.
-        enriched_world: list[AgentResult] = []
-        world_input = successful_assets[: self.config.max_assets]
-        if world_input and world_results:
-            enrichment_jobs = [
+        state.transition(PipelineStage.WORLD)
+        world_jobs: list[tuple[str, Any, Any, dict[str, Any]]] = []
+        for index in range(map_count):
+            world_jobs.append(
                 (
-                    f"world_enrich_{index:04d}",
+                    f"world_{index:04d}",
                     self.map_builder,
-                    "Refine this world sector using the real generated asset "
-                    "specifications. Return only structured world data.",
+                    (
+                        "Generate one world/scene sector specification from the authoritative game plan "
+                        "and the real asset specifications below. Return structured world data only.\n"
+                        f"SECTOR INDEX: {index}\n"
+                        f"GAME PROMPT: {state.prompt}"
+                    ),
                     {
-                        "generated_assets": world_input,
-                        "existing_sector": result.result,
+                        "generated_assets": real_assets,
                         "game_plan": _json_safe(plan),
                         "prompt": state.prompt,
                         "sector_index": index,
+                        "build_id": state.build_id,
                     },
                 )
-                for index, result in enumerate(world_results)
-                if result.ok
-            ]
-            if enrichment_jobs:
-                enriched_world = await self._run_parallel(enrichment_jobs)
-                for result in enriched_world:
-                    state.add_result(result)
+            )
 
-        return asset_results, enriched_world or world_results
+        world_results = await self._run_parallel(world_jobs)
+        for result in world_results:
+            state.add_result(result)
+
+        if not real_assets:
+            state.warnings.append("asset phase produced no usable structured assets")
+        if not any(result.ok for result in world_results):
+            state.warnings.append("world phase produced no successful sector result")
+
+        return asset_results, world_results
+
+    async def _gameplay_agent_phase(
+        self,
+        state: PipelineState,
+        plan: Any,
+        assets: list[Any],
+        world: list[Any],
+        physics: Any,
+    ) -> Optional[AgentResult]:
+        """Run the specialist gameplay compiler when the module exists."""
+        if self.gameplay_agent is None:
+            return None
+
+        state.transition(PipelineStage.GAMEPLAY)
+        context = {
+            "build_id": state.build_id,
+            "game_id": state.game_id,
+            "target_platform": state.target_platform,
+            "prompt": state.prompt,
+            "plan": _json_safe(plan),
+            "assets": _json_safe(assets),
+            "world": _json_safe(world),
+            "physics": _json_safe(physics),
+            "source_contract": {
+                "required_shape": {
+                    "source_files": [{"path": "...", "content": "..."}],
+                    "gameplay_modules": [],
+                    "runtime_entry": "...",
+                    "events": [],
+                    "input_actions": [],
+                    "save_state": {},
+                }
+            },
+        }
+        directive = (
+            "Compile the executable gameplay/source specification for this game. "
+            "Use the supplied architecture, real asset specifications, world sectors and physics output. "
+            "Return real source files and structured gameplay data; never claim execution or compilation."
+        )
+        result = await self._run_agent(
+            task_id="gameplay",
+            agent=self.gameplay_agent,
+            task_data=directive,
+            kwargs={
+                "context": context,
+                "game_plan": _json_safe(plan),
+                "assets": _json_safe(assets),
+                "world": _json_safe(world),
+                "physics": _json_safe(physics),
+                "target_platform": state.target_platform,
+            },
+        )
+        state.add_result(result)
+        return result
 
     async def _physics(
         self,
@@ -1206,6 +1383,9 @@ requestAnimationFrame(tick);
         prompt: str,
         agent_count: int = 10,
         auto_kill_after_execution: bool = True,
+        *,
+        target_platform: Optional[str] = None,
+        context_data: Optional[Mapping[str, Any]] = None,
     ) -> dict[str, Any]:
         if not isinstance(prompt, str) or not prompt.strip():
             return {
@@ -1216,16 +1396,14 @@ requestAnimationFrame(tick);
 
         build_id = f"BUILD_{uuid.uuid4().hex}"
         plan_hint_id = _stable_id("game", prompt, time.time_ns())
-        target_platform = "web"
+        target_platform = _safe_target(target_platform or (context_data or {}).get("target_platform", "web"))
 
-        # The existing main.py does not pass target platform directly. Keep the
-        # default compatible, while allowing callers to put it in a directive
-        # or environment in future revisions.
         state = PipelineState(
             build_id=build_id,
             game_id=plan_hint_id,
             prompt=prompt.strip(),
             target_platform=target_platform,
+            context_data=dict(context_data or {}),
         )
 
         pipeline_task = asyncio.current_task()
@@ -1244,21 +1422,7 @@ requestAnimationFrame(tick);
                 if not plan_result.ok:
                     raise RuntimeError(plan_result.error or "planning failed")
 
-                plan = _extract_agent_payload(plan_result.result)
-                if isinstance(plan, Mapping):
-                    requested_game_id = (
-                        plan.get("game_id")
-                        or plan.get("project_id")
-                        or plan.get("id")
-                    )
-                    if requested_game_id:
-                        state.game_id = _safe_game_id(requested_game_id)
-                    target_platform = (
-                        plan.get("target_platform")
-                        or plan.get("platform")
-                    )
-                    if target_platform:
-                        state.target_platform = _safe_target(target_platform)
+                plan = _extract_plan_payload(plan_result.result)
 
                 # ---------------------------------------------------------
                 # 2/3. ASSETS + WORLD
@@ -1548,13 +1712,19 @@ async def generate_full_game_with_swarm(
     prompt: str,
     agent_count: int = 10,
     auto_kill_after_execution: bool = True,
+    *,
+    target_platform: Optional[str] = None,
+    context_data: Optional[Mapping[str, Any]] = None,
+    gateway: Any = None,
 ) -> dict[str, Any]:
     """Module-level compatibility wrapper."""
-    orchestrator = GodOrchestrator()
+    orchestrator = GodOrchestrator(gateway=gateway)
     return await orchestrator.generate_full_game_with_swarm(
         prompt=prompt,
         agent_count=agent_count,
         auto_kill_after_execution=auto_kill_after_execution,
+        target_platform=target_platform,
+        context_data=context_data,
     )
 
 
