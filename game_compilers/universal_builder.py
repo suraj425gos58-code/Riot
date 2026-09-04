@@ -35,6 +35,8 @@ import logging
 import os
 import re
 import shutil
+import stat
+import subprocess
 import tempfile
 import time
 import uuid
@@ -57,6 +59,8 @@ DEFAULT_MAX_SOURCE_FILE_BYTES = 25 * 1024 * 1024
 DEFAULT_MAX_SOURCE_FILES = 20_000
 DEFAULT_OUTPUT_ROOT = os.getenv("RIOT_BUILD_ROOT", "build_output")
 DEFAULT_WORK_ROOT = os.getenv("RIOT_BUILD_WORK_ROOT", ".riot_build_work")
+DEFAULT_MAX_TOTAL_SOURCE_BYTES = int(os.getenv("RIOT_BUILD_MAX_TOTAL_SOURCE_BYTES", str(250 * 1024 * 1024)))
+DEFAULT_MAX_CONCURRENT_BUILDS = max(1, int(os.getenv("RIOT_BUILD_MAX_CONCURRENT_BUILDS", "2")))
 
 _RESERVED_MOCK_MARKERS = (
     "Compiled by God Node",
@@ -119,6 +123,7 @@ class BuildLimits:
     max_log_bytes: int = DEFAULT_MAX_LOG_BYTES
     max_source_file_bytes: int = DEFAULT_MAX_SOURCE_FILE_BYTES
     max_source_files: int = DEFAULT_MAX_SOURCE_FILES
+    max_total_source_bytes: int = DEFAULT_MAX_TOTAL_SOURCE_BYTES
 
 
 @dataclass(slots=True)
@@ -195,11 +200,14 @@ def _normalize_target(value: Any) -> BuildTarget:
     aliases = {
         "web_html5": BuildTarget.WEB,
         "html5": BuildTarget.WEB,
+        "mobile_apk": BuildTarget.MOBILE,
         "android": BuildTarget.MOBILE,
         "apk": BuildTarget.MOBILE,
+        "pc_exe": BuildTarget.PC,
         "windows": BuildTarget.PC,
         "desktop": BuildTarget.PC,
         "exe": BuildTarget.PC,
+        "cloud_stream": BuildTarget.WEB,
     }
     try:
         return BuildTarget(raw)
@@ -271,7 +279,7 @@ def _detect_tool(executable: str, version_args: Sequence[str] = ("--version",)) 
     version = None
     detail = None
     try:
-        completed = __import__("subprocess").run(
+        completed = subprocess.run(
             [path, *version_args],
             capture_output=True,
             text=True,
@@ -330,9 +338,18 @@ class ProjectSourceLoader:
             if not root.is_dir():
                 raise BuildValidationError(f"project_directory does not exist: {root}")
             result: dict[str, bytes] = {}
+            ignored_dirs = {".git", ".hg", ".svn", "node_modules", ".gradle", "__pycache__", ".riot_build_work", "build_output"}
             for path in root.rglob("*"):
+                relative_path = path.relative_to(root)
+                if any(part in ignored_dirs for part in relative_path.parts):
+                    continue
+                if path.is_symlink():
+                    raise BuildValidationError(f"symlinked project entry is not allowed: {relative_path.as_posix()}")
                 if path.is_file():
-                    relative = path.relative_to(root).as_posix()
+                    mode = path.stat().st_mode
+                    if not stat.S_ISREG(mode):
+                        raise BuildValidationError(f"non-regular project file is not allowed: {relative_path.as_posix()}")
+                    relative = relative_path.as_posix()
                     result[relative] = path.read_bytes()
             return result
 
@@ -396,6 +413,8 @@ class BuildWorkspace:
             if len(payload) > limits.max_source_file_bytes:
                 raise BuildValidationError(f"source file too large: {relative}")
             total_bytes += len(payload)
+            if total_bytes > limits.max_total_source_bytes:
+                raise BuildValidationError(f"project source exceeds {limits.max_total_source_bytes} bytes")
             destination = self.root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             if not _within(self.root, destination):
@@ -444,9 +463,8 @@ class AsyncCommandRunner:
         safe_command = [str(part) for part in command]
         logger.info("Build command: %s", " ".join(safe_command))
 
-        process_env = os.environ.copy()
-        if env:
-            process_env.update({str(k): str(v) for k, v in env.items()})
+        process_env = self._build_process_env(env)
+        process = None
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -455,16 +473,13 @@ class AsyncCommandRunner:
                 env=process_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=(os.name != "nt"),
             )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 process.communicate(), timeout=timeout
             )
         except asyncio.TimeoutError as exc:
-            try:
-                process.kill()  # type: ignore[has-type]
-                await process.wait()  # type: ignore[has-type]
-            except Exception:
-                pass
+            await self._terminate_process_tree(process)
             raise BuildTimeoutError(
                 f"build command timed out after {timeout:.0f}s: {safe_command[0]}"
             ) from exc
@@ -486,6 +501,57 @@ class AsyncCommandRunner:
                 f"build command failed with exit code {result.return_code}: {result.stderr[-2000:] or result.stdout[-2000:]}"
             )
         return result
+
+
+    @staticmethod
+    def _build_process_env(extra: Optional[Mapping[str, str]]) -> dict[str, str]:
+        """Pass only build-essential environment variables by default.
+
+        Provider/API credentials are intentionally not inherited by arbitrary build scripts.
+        Projects that genuinely need custom values must supply them through build_env.
+        """
+        allowed = {
+            "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "TMP", "TEMP",
+            "HOME", "USERPROFILE", "JAVA_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT",
+            "ANDROID_NDK_HOME", "GRADLE_USER_HOME", "NODE_PATH", "CI",
+        }
+        result = {k: v for k, v in os.environ.items() if k in allowed}
+        if "PATH" not in result:
+            result["PATH"] = os.defpath
+        if extra:
+            for key, value in extra.items():
+                result[str(key)] = str(value)
+        return result
+
+    @staticmethod
+    async def _terminate_process_tree(process: Any) -> None:
+        if process is None:
+            return
+        try:
+            if process.returncode is not None:
+                return
+            if os.name != "nt":
+                import signal
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            else:
+                process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                if os.name != "nt":
+                    import signal
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                else:
+                    process.kill()
+                await process.wait()
+        except ProcessLookupError:
+            return
+        except Exception:
+            try:
+                process.kill()
+                await process.wait()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -556,7 +622,6 @@ class AndroidBackend(BuildBackend):
         tools = [
             _detect_tool("java"),
             _detect_tool("gradle"),
-            _detect_tool("adb"),
         ]
         if os.getenv("ANDROID_HOME"):
             tools.append(ToolchainInfo("ANDROID_HOME", True, path=os.getenv("ANDROID_HOME")))
@@ -585,7 +650,11 @@ class AndroidBackend(BuildBackend):
 
         output_dir.mkdir(parents=True, exist_ok=True)
         command = [executable, "assembleRelease", "--no-daemon", "--stacktrace"]
-        result = await runner.run(command, cwd=workspace)
+        result = await runner.run(
+            command,
+            cwd=workspace,
+            env=config.get("build_env") if isinstance(config.get("build_env"), Mapping) else None,
+        )
         report.commands.append(result)
 
         candidates = list(workspace.rglob("*.apk")) + list(workspace.rglob("*.aab"))
@@ -634,10 +703,18 @@ class PcBackend(BuildBackend):
 
         install_needed = not (workspace / "node_modules").exists()
         if install_needed:
-            install = await runner.run([npm, "ci", "--no-audit", "--no-fund"], cwd=workspace)
+            install = await runner.run(
+                [npm, "ci", "--no-audit", "--no-fund"],
+                cwd=workspace,
+                env=config.get("build_env") if isinstance(config.get("build_env"), Mapping) else None,
+            )
             report.commands.append(install)
 
-        build = await runner.run([npm, "run", "build"], cwd=workspace)
+        build = await runner.run(
+            [npm, "run", "build"],
+            cwd=workspace,
+            env=config.get("build_env") if isinstance(config.get("build_env"), Mapping) else None,
+        )
         report.commands.append(build)
 
         configured_candidates = config.get("pc_artifact_patterns")
@@ -684,6 +761,7 @@ class UniversalBuilder:
                 os.getenv("RIOT_BUILD_MAX_SOURCE_FILE_BYTES", DEFAULT_MAX_SOURCE_FILE_BYTES)
             ),
             max_source_files=int(os.getenv("RIOT_BUILD_MAX_SOURCE_FILES", DEFAULT_MAX_SOURCE_FILES)),
+            max_total_source_bytes=int(os.getenv("RIOT_BUILD_MAX_TOTAL_SOURCE_BYTES", DEFAULT_MAX_TOTAL_SOURCE_BYTES)),
         )
         self.loader = ProjectSourceLoader()
         self.runner = AsyncCommandRunner(self.limits)
@@ -692,13 +770,19 @@ class UniversalBuilder:
             BuildTarget.MOBILE: AndroidBackend(),
             BuildTarget.PC: PcBackend(),
         }
+        self._build_semaphore = asyncio.Semaphore(DEFAULT_MAX_CONCURRENT_BUILDS)
 
     async def build_game(self, config: Mapping[str, Any]) -> dict[str, Any]:
         """Build a game project and return a JSON-serializable report."""
+        if hasattr(config, "to_builder_config") and callable(getattr(config, "to_builder_config")):
+            config = config.to_builder_config()
         if not isinstance(config, Mapping):
-            raise BuildValidationError("build_game expects a mapping")
+            raise BuildValidationError("build_game expects a mapping or canonical GameProject")
 
-        build_id = f"BUILD_{uuid.uuid4().hex}"
+        incoming_build_id = str(config.get("build_id") or "").strip()
+        build_id = incoming_build_id or f"BUILD_{uuid.uuid4().hex}"
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", build_id):
+            raise BuildValidationError("build_id contains unsupported characters")
         game_id = _safe_game_id(config.get("game_id"))
         target = _normalize_target(config.get("target_platform"))
         started = time.time()
@@ -711,53 +795,53 @@ class UniversalBuilder:
         )
         workspace = BuildWorkspace(self.work_root, build_id)
 
-        try:
-            report.status = BuildStatus.STAGING
-            files = self.loader.load(config)
-            root = workspace.create()
-            report.workspace = str(root)
-            workspace.materialize(files, self.limits)
+        async with self._build_semaphore:
+            try:
+                report.status = BuildStatus.STAGING
+                files = self.loader.load(config)
+                root = workspace.create()
+                report.workspace = str(root)
+                workspace.materialize(files, self.limits)
 
-            backend = self.backends[target]
-            report.toolchains = backend.detect()
+                backend = self.backends[target]
+                report.toolchains = backend.detect()
 
-            # Web only needs a packager; mobile/PC require actual native build infrastructure.
-            if target is not BuildTarget.WEB:
-                required = self._backend_has_minimum_capability(target, report.toolchains)
-                if not required:
-                    report.status = BuildStatus.UNAVAILABLE
-                    report.errors.append(
-                        f"No usable toolchain/project detected for target {target.value}"
-                    )
-                    return self._finalize(report)
+                # Web only needs a packager; mobile/PC require actual native build infrastructure.
+                if target is not BuildTarget.WEB:
+                    required = self._backend_has_minimum_capability(target, report.toolchains)
+                    if not required:
+                        report.status = BuildStatus.UNAVAILABLE
+                        report.errors.append(
+                            f"No usable toolchain/project detected for target {target.value}"
+                        )
+                        return self._finalize(report)
 
-            report.status = BuildStatus.BUILDING
-            output_dir = self.output_root / target.value
-            artifact_path = await backend.build(root, output_dir, config, self.runner, report)
+                report.status = BuildStatus.BUILDING
+                output_dir = self.output_root / target.value
+                artifact_path = await backend.build(root, output_dir, config, self.runner, report)
 
-            report.status = BuildStatus.VALIDATING
-            artifact = self._verify_artifact(artifact_path, target, report)
-            report.artifact = artifact
-            report.status = BuildStatus.SUCCESS
-            return self._finalize(report)
+                report.status = BuildStatus.VALIDATING
+                artifact = self._verify_artifact(artifact_path, target, report)
+                report.artifact = artifact
+                report.status = BuildStatus.SUCCESS
+                return self._finalize(report)
 
-        except BuildUnavailableError as exc:
-            report.status = BuildStatus.UNAVAILABLE
-            report.errors.append(str(exc))
-            return self._finalize(report)
-        except BuildError as exc:
-            report.status = BuildStatus.FAILED
-            report.errors.append(str(exc))
-            logger.exception("Build failed: %s", exc)
-            return self._finalize(report)
-        except Exception as exc:  # fail closed
-            report.status = BuildStatus.FAILED
-            report.errors.append(f"unexpected builder failure: {exc}")
-            logger.exception("Unexpected build failure")
-            return self._finalize(report)
-        finally:
-            workspace.cleanup()
-
+            except BuildUnavailableError as exc:
+                report.status = BuildStatus.UNAVAILABLE
+                report.errors.append(str(exc))
+                return self._finalize(report)
+            except BuildError as exc:
+                report.status = BuildStatus.FAILED
+                report.errors.append(str(exc))
+                logger.exception("Build failed: %s", exc)
+                return self._finalize(report)
+            except Exception as exc:  # fail closed
+                report.status = BuildStatus.FAILED
+                report.errors.append(f"unexpected builder failure: {exc}")
+                logger.exception("Unexpected build failure")
+                return self._finalize(report)
+            finally:
+                workspace.cleanup()
     @staticmethod
     def _backend_has_minimum_capability(target: BuildTarget, tools: Sequence[ToolchainInfo]) -> bool:
         if target is BuildTarget.MOBILE:
@@ -766,14 +850,32 @@ class UniversalBuilder:
             has_sdk = any(t.executable in {"ANDROID_HOME", "ANDROID_SDK_ROOT"} and t.available for t in tools)
             # A generated project may carry its own Gradle wrapper, so host Gradle
             # is optional; Java + Android SDK are the host-level essentials.
-            return has_java and has_sdk and (has_gradle or True)
+            has_wrapper = True  # actual wrapper availability is checked during build()
+            return has_java and has_sdk and (has_gradle or has_wrapper)
         if target is BuildTarget.PC:
             return any(t.executable == "npm" and t.available for t in tools) and any(
                 t.executable == "node" and t.available for t in tools
             )
         return True
 
+    def _verify_output_path(self, artifact_path: Path) -> None:
+        output_root = self.output_root.resolve()
+        resolved = artifact_path.resolve()
+        try:
+            resolved.relative_to(output_root)
+        except ValueError as exc:
+            raise BuildExecutionError("artifact path escaped configured output root") from exc
+
+    @staticmethod
+    def _atomic_copy(source: Path, destination: Path) -> Path:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(destination.name + f".tmp-{uuid.uuid4().hex}")
+        shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+        return destination
+
     def _verify_artifact(self, artifact_path: Path, target: BuildTarget, report: BuildReport) -> BuildArtifact:
+        self._verify_output_path(artifact_path)
         if not artifact_path.exists() or not artifact_path.is_file():
             raise BuildExecutionError("builder reported an artifact that does not exist")
         size = artifact_path.stat().st_size
@@ -803,6 +905,8 @@ class UniversalBuilder:
                 raise BuildExecutionError("PC backend produced an unexpected artifact type")
             if artifact_path.suffix.lower() == ".exe":
                 self._verify_binary_signature(artifact_path, b"MZ")
+            else:
+                self._verify_binary_signature(artifact_path, b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
 
         return BuildArtifact(
             path=str(artifact_path.resolve()),
@@ -827,6 +931,7 @@ class UniversalBuilder:
         report.finished_at = time.time()
         report.duration_ms = max(0.0, (report.finished_at - report.started_at) * 1000.0)
         result = report.to_dict()
+        result["contract_version"] = "riot.builder.v3"
         # Keep API compatibility with older main.py callers.
         result["message"] = {
             BuildStatus.SUCCESS: "Build completed and artifact verified.",
