@@ -1,23 +1,15 @@
 """
 routing_policy.py
 
-Pure architectural components for God Node.
+Pure provider eligibility and health-based routing policy.
 
-This module intentionally contains:
-- Health-based provider selection logic
-- Request normalization interfaces
-- Abstract adapter skeletons
-
-It intentionally DOES NOT contain:
-- External API calls
-- HTTP execution
-- Provider-specific implementations
-- API endpoint wiring
+No HTTP.
+No provider execution.
+No API calls.
 """
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Protocol
@@ -27,7 +19,7 @@ from .provider_sdk import PromptRequest
 
 
 # ============================================================
-# ENUMS
+# CAPABILITIES
 # ============================================================
 
 class ProviderCapability(str, Enum):
@@ -43,17 +35,16 @@ class ProviderCapability(str, Enum):
 
 
 # ============================================================
-# ROUTING REQUEST
+# REQUEST
 # ============================================================
 
 @dataclass(slots=True)
 class RoutingRequest:
-
     prompt: PromptRequest
 
-    required_capabilities: set[ProviderCapability] = field(
-        default_factory=set
-    )
+    required_capabilities: set[
+        ProviderCapability
+    ] = field(default_factory=set)
 
     preferred_provider: Optional[str] = None
 
@@ -67,21 +58,20 @@ class RoutingRequest:
 
 
 # ============================================================
-# PROVIDER DESCRIPTOR
+# PROVIDER
 # ============================================================
 
 @dataclass(slots=True)
 class ProviderDescriptor:
-
     name: str
 
     enabled: bool = True
 
     priority: int = 100
 
-    capabilities: set[ProviderCapability] = field(
-        default_factory=set
-    )
+    capabilities: set[
+        ProviderCapability
+    ] = field(default_factory=set)
 
     metadata: Dict[str, Any] = field(
         default_factory=dict
@@ -89,12 +79,11 @@ class ProviderDescriptor:
 
 
 # ============================================================
-# NORMALIZED PAYLOAD
+# NORMALIZATION
 # ============================================================
 
 @dataclass(slots=True)
 class NormalizedPayload:
-
     body: Dict[str, Any]
 
     headers: Dict[str, str] = field(
@@ -106,12 +95,7 @@ class NormalizedPayload:
     )
 
 
-# ============================================================
-# PAYLOAD BUILDER PROTOCOL
-# ============================================================
-
 class PayloadBuilder(Protocol):
-
     def build(
         self,
         request: RoutingRequest,
@@ -119,71 +103,61 @@ class PayloadBuilder(Protocol):
         ...
 
 
-# ============================================================
-# ABSTRACT NORMALIZER
-# ============================================================
-
-class RequestNormalizer(ABC):
-
-    @abstractmethod
+class RequestNormalizer:
     def normalize(
         self,
         request: RoutingRequest,
     ) -> NormalizedPayload:
-        ...
+        raise NotImplementedError
 
 
-# ============================================================
-# BASE ADAPTER SKELETON
-# ============================================================
-
-class ProviderAdapterSkeleton(RequestNormalizer):
-
+class ProviderAdapterSkeleton(
+    RequestNormalizer
+):
     def __init__(
         self,
         descriptor: ProviderDescriptor,
-    ):
-
+    ) -> None:
         self.descriptor = descriptor
 
     def normalize(
         self,
         request: RoutingRequest,
     ) -> NormalizedPayload:
-
         return self.build_payload(request)
 
-    @abstractmethod
     def build_payload(
         self,
         request: RoutingRequest,
     ) -> NormalizedPayload:
-        ...
+        raise NotImplementedError
 
-
-# ============================================================
-# DEFAULT GENERIC ADAPTER
-# ============================================================
 
 class GenericJSONAdapter(
     ProviderAdapterSkeleton
 ):
-
     def build_payload(
         self,
         request: RoutingRequest,
     ) -> NormalizedPayload:
-
-        payload = {
-            "prompt": request.prompt.prompt,
-            "system_prompt": request.prompt.system_prompt,
-            "temperature": request.prompt.temperature,
-            "max_tokens": request.prompt.max_tokens,
-            "metadata": request.prompt.metadata,
-        }
+        request.prompt.validate()
 
         return NormalizedPayload(
-            body=payload
+            body={
+                "prompt": request.prompt.prompt,
+                "system_prompt": (
+                    request.prompt.system_prompt
+                ),
+                "temperature": (
+                    request.prompt.temperature
+                ),
+                "max_tokens": (
+                    request.prompt.max_tokens
+                ),
+                "metadata": dict(
+                    request.prompt.metadata
+                ),
+            }
         )
 
 
@@ -192,14 +166,73 @@ class GenericJSONAdapter(
 # ============================================================
 
 class HealthRoutingPolicy:
-
     """
-    Pure health-based provider selector.
+    Pure deterministic provider selection.
 
-    Uses provider health snapshots only.
+    Eligibility is checked BEFORE scoring:
+    1. enabled
+    2. not excluded
+    3. capabilities
+    4. circuit availability
 
-    No execution logic.
+    Preferred provider is only a preference; it cannot bypass
+    safety/eligibility rules.
     """
+
+    def _eligible(
+        self,
+        provider: ProviderDescriptor,
+        request: RoutingRequest,
+    ) -> bool:
+
+        if not provider.enabled:
+            return False
+
+        if provider.name in request.excluded_providers:
+            return False
+
+        required = request.required_capabilities
+
+        if (
+            required
+            and not required.issubset(
+                provider.capabilities
+            )
+        ):
+            return False
+
+        health = CIRCUIT_REGISTRY.health().get(
+            provider.name
+        )
+
+        if (
+            health is not None
+            and health.state.value == "open"
+        ):
+            return False
+
+        return True
+
+    def _score(
+        self,
+        provider: ProviderDescriptor,
+    ) -> tuple[float, int, str]:
+
+        health = CIRCUIT_REGISTRY.health().get(
+            provider.name
+        )
+
+        health_score = (
+            100.0
+            if health is None
+            else health.score
+        )
+
+        return (
+            health_score,
+            -provider.priority,
+            provider.name,
+        )
 
     def select_provider(
         self,
@@ -209,84 +242,46 @@ class HealthRoutingPolicy:
 
         provider_list = list(providers)
 
+        # Preferred provider is valid only if it satisfies
+        # EVERY eligibility rule.
         if request.preferred_provider:
-
             for provider in provider_list:
-
                 if (
-                    provider.enabled
-                    and provider.name
+                    provider.name
                     == request.preferred_provider
+                    and self._eligible(
+                        provider,
+                        request,
+                    )
                 ):
                     return provider.name
 
-        candidates: List[tuple] = []
-
-        registry = CIRCUIT_REGISTRY.health()
-
-        for provider in provider_list:
-
-            if not provider.enabled:
-                continue
-
-            if provider.name in request.excluded_providers:
-                continue
-
-            if (
-                request.required_capabilities
-                and not request.required_capabilities.issubset(
-                    provider.capabilities
-                )
-            ):
-                continue
-
-            health = registry.get(provider.name)
-
-            if health is None:
-
-                score = 100.0
-
-                state = "closed"
-
-            else:
-
-                score = health.score
-
-                state = health.state.value
-
-            if state == "open":
-                continue
-
-            candidates.append(
-                (
-                    score,
-                    provider.priority,
-                    provider.name,
-                )
+        candidates = [
+            provider
+            for provider in provider_list
+            if self._eligible(
+                provider,
+                request,
             )
+        ]
 
         if not candidates:
             return None
 
         candidates.sort(
-            key=lambda item: (
-                item[0],
-                item[1],
-            ),
+            key=self._score,
             reverse=True,
         )
 
-        return candidates[0][2]
+        return candidates[0].name
 
 
 # ============================================================
-# REGISTRY
+# PROVIDER CATALOG
 # ============================================================
 
 class ProviderCatalog:
-
-    def __init__(self):
-
+    def __init__(self) -> None:
         self._providers: Dict[
             str,
             ProviderDescriptor,
@@ -296,6 +291,10 @@ class ProviderCatalog:
         self,
         provider: ProviderDescriptor,
     ) -> None:
+        if not provider.name.strip():
+            raise ValueError(
+                "provider name must not be empty"
+            )
 
         self._providers[
             provider.name
@@ -305,7 +304,6 @@ class ProviderCatalog:
         self,
         provider_name: str,
     ) -> None:
-
         self._providers.pop(
             provider_name,
             None,
@@ -315,23 +313,20 @@ class ProviderCatalog:
         self,
         provider_name: str,
     ) -> Optional[ProviderDescriptor]:
-
         return self._providers.get(
             provider_name
         )
 
-    def all(
-        self,
-    ) -> List[ProviderDescriptor]:
-
+    def all(self) -> List[
+        ProviderDescriptor
+    ]:
         return list(
             self._providers.values()
         )
 
-    def enabled(
-        self,
-    ) -> List[ProviderDescriptor]:
-
+    def enabled(self) -> List[
+        ProviderDescriptor
+    ]:
         return [
             provider
             for provider in self._providers.values()
@@ -340,11 +335,11 @@ class ProviderCatalog:
 
     def as_mapping(
         self,
-    ) -> Mapping[str, ProviderDescriptor]:
-
-        return dict(
-            self._providers
-        )
+    ) -> Mapping[
+        str,
+        ProviderDescriptor,
+    ]:
+        return dict(self._providers)
 
 
 # ============================================================
@@ -352,25 +347,28 @@ class ProviderCatalog:
 # ============================================================
 
 class RoutingPolicy:
-
-    def __init__(self):
-
+    def __init__(self) -> None:
         self.catalog = ProviderCatalog()
-
         self.policy = HealthRoutingPolicy()
 
     def register(
         self,
         provider: ProviderDescriptor,
     ) -> None:
-
         self.catalog.register(provider)
+
+    def unregister(
+        self,
+        provider_name: str,
+    ) -> None:
+        self.catalog.unregister(
+            provider_name
+        )
 
     def choose(
         self,
         request: RoutingRequest,
     ) -> Optional[str]:
-
         return self.policy.select_provider(
             self.catalog.enabled(),
             request,
