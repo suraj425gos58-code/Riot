@@ -1,20 +1,7 @@
 """
 circuit_breaker.py
 
-Enterprise-grade Circuit Breaker, Retry Engine and Provider Health Monitor.
-
-Features
---------
-- Async-safe
-- Exponential backoff with jitter
-- Retry policy
-- Provider health scoring
-- Circuit Breaker (Closed / Open / Half-Open)
-- Failure threshold
-- Recovery timeout
-- Success recovery
-- Provider metrics
-- Easy integration with aiohttp-based routers
+Async circuit breaker, retry engine and provider health registry.
 """
 
 from __future__ import annotations
@@ -24,7 +11,6 @@ import enum
 import logging
 import random
 import time
-
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Dict, Optional, Tuple, TypeVar
 
@@ -34,7 +20,7 @@ T = TypeVar("T")
 
 
 # ============================================================
-# CIRCUIT STATES
+# STATES
 # ============================================================
 
 class CircuitState(str, enum.Enum):
@@ -44,7 +30,7 @@ class CircuitState(str, enum.Enum):
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
 @dataclass(slots=True)
@@ -56,6 +42,8 @@ class RetryConfig:
     jitter: bool = True
 
     retry_http_codes: Tuple[int, ...] = (
+        408,
+        425,
         429,
         500,
         502,
@@ -66,6 +54,7 @@ class RetryConfig:
     retry_exceptions: Tuple[type, ...] = (
         TimeoutError,
         asyncio.TimeoutError,
+        ConnectionError,
     )
 
 
@@ -78,12 +67,11 @@ class CircuitConfig:
 
 
 # ============================================================
-# PROVIDER HEALTH
+# HEALTH
 # ============================================================
 
 @dataclass(slots=True)
 class ProviderHealth:
-
     provider: str
 
     state: CircuitState = CircuitState.CLOSED
@@ -92,15 +80,13 @@ class ProviderHealth:
 
     successes: int = 0
     failures: int = 0
+    total_requests: int = 0
 
     consecutive_failures: int = 0
     consecutive_successes: int = 0
 
-    total_requests: int = 0
-
     last_error: Optional[str] = None
     last_failure_time: float = 0.0
-
     opened_until: float = 0.0
 
     latency_ms: float = 0.0
@@ -109,26 +95,35 @@ class ProviderHealth:
 
 
 # ============================================================
+# EXCEPTIONS
+# ============================================================
+
+class CircuitOpenError(RuntimeError):
+    """Provider circuit is not currently available."""
+
+
+class HalfOpenCapacityError(RuntimeError):
+    """Half-open circuit probe capacity is exhausted."""
+
+
+# ============================================================
 # RETRY ENGINE
 # ============================================================
 
 class RetryEngine:
-
     def __init__(
         self,
         config: RetryConfig | None = None,
-    ):
-
+    ) -> None:
         self.config = config or RetryConfig()
 
-    async def sleep(
-        self,
-        attempt: int,
-    ):
+        if self.config.max_attempts <= 0:
+            raise ValueError("max_attempts must be > 0")
 
+    async def sleep(self, attempt: int) -> None:
         delay = min(
-            self.config.base_delay *
-            (self.config.exponential_base ** attempt),
+            self.config.base_delay
+            * (self.config.exponential_base ** attempt),
             self.config.max_delay,
         )
 
@@ -137,18 +132,10 @@ class RetryEngine:
 
         await asyncio.sleep(delay)
 
-    def should_retry_http(
-        self,
-        status: int,
-    ) -> bool:
-
+    def should_retry_http(self, status: int) -> bool:
         return status in self.config.retry_http_codes
 
-    def should_retry_exception(
-        self,
-        exc: Exception,
-    ) -> bool:
-
+    def should_retry_exception(self, exc: Exception) -> bool:
         return isinstance(
             exc,
             self.config.retry_exceptions,
@@ -160,134 +147,187 @@ class RetryEngine:
 # ============================================================
 
 class ProviderCircuitBreaker:
-
     def __init__(
         self,
         provider: str,
         config: CircuitConfig | None = None,
-    ):
-
+    ) -> None:
         self.provider = provider
         self.config = config or CircuitConfig()
 
+        if self.config.failure_threshold <= 0:
+            raise ValueError("failure_threshold must be > 0")
+
+        if self.config.recovery_timeout <= 0:
+            raise ValueError("recovery_timeout must be > 0")
+
+        if self.config.half_open_max_calls <= 0:
+            raise ValueError("half_open_max_calls must be > 0")
+
+        if self.config.success_threshold <= 0:
+            raise ValueError("success_threshold must be > 0")
+
         self.health = ProviderHealth(
-            provider=provider
+            provider=provider,
         )
 
         self._lock = asyncio.Lock()
-
-    # --------------------------------------------------------
+        self._half_open_in_flight = 0
 
     async def allow_request(self) -> bool:
+        """
+        Reserve a request slot.
+
+        CLOSED:
+            allow normally.
+
+        OPEN:
+            deny until recovery timeout.
+
+        HALF_OPEN:
+            allow only up to half_open_max_calls concurrent probes.
+        """
 
         async with self._lock:
+            now = time.monotonic()
+            state = self.health.state
 
-            now = time.time()
+            if state == CircuitState.OPEN:
+                if now < self.health.opened_until:
+                    return False
 
-            if self.health.state == CircuitState.OPEN:
+                self.health.state = CircuitState.HALF_OPEN
+                self.health.consecutive_successes = 0
+                self._half_open_in_flight = 0
 
-                if now >= self.health.opened_until:
+                state = CircuitState.HALF_OPEN
 
-                    logger.warning(
-                        "%s entering HALF_OPEN",
-                        self.provider,
-                    )
+                logger.warning(
+                    "%s entering HALF_OPEN",
+                    self.provider,
+                )
 
-                    self.health.state = CircuitState.HALF_OPEN
+            if state == CircuitState.HALF_OPEN:
+                if (
+                    self._half_open_in_flight
+                    >= self.config.half_open_max_calls
+                ):
+                    return False
 
-                    self.health.consecutive_successes = 0
-
-                    return True
-
-                return False
+                self._half_open_in_flight += 1
 
             return True
 
-    # --------------------------------------------------------
+    async def _release_half_open_probe(self) -> None:
+        if self._half_open_in_flight > 0:
+            self._half_open_in_flight -= 1
 
     async def on_success(
         self,
-        latency_ms: float = 0,
-    ):
-
+        latency_ms: float = 0.0,
+    ) -> None:
         async with self._lock:
+            previous_state = self.health.state
 
             self.health.total_requests += 1
-
             self.health.successes += 1
-
-            self.health.latency_ms = latency_ms
+            self.health.latency_ms = max(0.0, latency_ms)
 
             self.health.consecutive_successes += 1
-
             self.health.consecutive_failures = 0
 
             self.health.score = min(
-                100,
-                self.health.score + 2,
+                100.0,
+                self.health.score + 2.0,
             )
 
-            if self.health.state == CircuitState.HALF_OPEN:
+            if previous_state == CircuitState.HALF_OPEN:
+                await self._release_half_open_probe()
 
                 if (
                     self.health.consecutive_successes
                     >= self.config.success_threshold
                 ):
+                    self.health.state = CircuitState.CLOSED
+                    self.health.opened_until = 0.0
+                    self.health.last_error = None
 
                     logger.info(
-                        "%s recovered.",
+                        "%s circuit recovered and CLOSED.",
                         self.provider,
                     )
-
-                    self.health.state = CircuitState.CLOSED
-
-    # --------------------------------------------------------
 
     async def on_failure(
         self,
         reason: str,
-    ):
-
+        latency_ms: float = 0.0,
+    ) -> None:
         async with self._lock:
+            previous_state = self.health.state
 
             self.health.total_requests += 1
-
             self.health.failures += 1
-
             self.health.last_error = reason
-
             self.health.last_failure_time = time.time()
+            self.health.latency_ms = max(0.0, latency_ms)
 
             self.health.consecutive_failures += 1
-
             self.health.consecutive_successes = 0
 
             self.health.score = max(
-                0,
-                self.health.score - 10,
+                0.0,
+                self.health.score - 10.0,
             )
+
+            if previous_state == CircuitState.HALF_OPEN:
+                await self._release_half_open_probe()
+
+                self.health.state = CircuitState.OPEN
+                self.health.opened_until = (
+                    time.monotonic()
+                    + self.config.recovery_timeout
+                )
+
+                logger.error(
+                    "%s HALF_OPEN probe failed; circuit OPEN.",
+                    self.provider,
+                )
+                return
 
             if (
                 self.health.consecutive_failures
                 >= self.config.failure_threshold
             ):
+                self.health.state = CircuitState.OPEN
+                self.health.opened_until = (
+                    time.monotonic()
+                    + self.config.recovery_timeout
+                )
 
                 logger.error(
                     "%s circuit OPEN.",
                     self.provider,
                 )
 
-                self.health.state = CircuitState.OPEN
-
-                self.health.opened_until = (
-                    time.time()
-                    + self.config.recovery_timeout
-                )
-
-    # --------------------------------------------------------
-
     def snapshot(self) -> ProviderHealth:
-        return self.health
+        """
+        Return a detached health snapshot.
+        """
+        return ProviderHealth(
+            provider=self.health.provider,
+            state=self.health.state,
+            score=self.health.score,
+            successes=self.health.successes,
+            failures=self.health.failures,
+            total_requests=self.health.total_requests,
+            consecutive_failures=self.health.consecutive_failures,
+            consecutive_successes=self.health.consecutive_successes,
+            last_error=self.health.last_error,
+            last_failure_time=self.health.last_failure_time,
+            opened_until=self.health.opened_until,
+            latency_ms=self.health.latency_ms,
+            metadata=dict(self.health.metadata),
+        )
 
 
 # ============================================================
@@ -295,57 +335,76 @@ class ProviderCircuitBreaker:
 # ============================================================
 
 class CircuitRegistry:
-
-    def __init__(self):
-
+    def __init__(self) -> None:
         self._providers: Dict[
             str,
             ProviderCircuitBreaker,
         ] = {}
+        self._lock = asyncio.Lock()
 
-    def register(
+    async def register(
         self,
         provider: str,
     ) -> ProviderCircuitBreaker:
+        async with self._lock:
+            breaker = self._providers.get(provider)
 
-        if provider not in self._providers:
+            if breaker is None:
+                breaker = ProviderCircuitBreaker(provider)
+                self._providers[provider] = breaker
 
-            self._providers[provider] = (
-                ProviderCircuitBreaker(provider)
-            )
+            return breaker
 
-        return self._providers[provider]
+    def register_sync(
+        self,
+        provider: str,
+    ) -> ProviderCircuitBreaker:
+        """
+        Bootstrap-only synchronous registration.
+
+        Runtime code should use get().
+        """
+        breaker = self._providers.get(provider)
+
+        if breaker is None:
+            breaker = ProviderCircuitBreaker(provider)
+            self._providers[provider] = breaker
+
+        return breaker
+
+    def get_sync(
+        self,
+        provider: str,
+    ) -> ProviderCircuitBreaker:
+        return self.register_sync(provider)
 
     def get(
         self,
         provider: str,
     ) -> ProviderCircuitBreaker:
+        return self.get_sync(provider)
 
-        return self.register(provider)
-
-    def health(self):
-
+    def health(self) -> dict[str, ProviderHealth]:
         return {
             name: breaker.snapshot()
-            for name, breaker
-            in self._providers.items()
+            for name, breaker in self._providers.items()
         }
+
+    def providers(self) -> tuple[str, ...]:
+        return tuple(self._providers.keys())
 
 
 # ============================================================
-# EXECUTION WRAPPER
+# EXECUTOR
 # ============================================================
 
 class ProviderExecutor:
-
     def __init__(
         self,
         registry: CircuitRegistry,
         retry: RetryEngine | None = None,
-    ):
-
+    ) -> None:
         self.registry = registry
-
         self.retry = retry or RetryEngine()
 
     async def execute(
@@ -353,37 +412,39 @@ class ProviderExecutor:
         provider: str,
         operation: Callable[[], Awaitable[T]],
     ) -> T:
-
         breaker = self.registry.get(provider)
 
         if not await breaker.allow_request():
-
-            raise RuntimeError(
-                f"{provider} circuit is OPEN."
+            raise CircuitOpenError(
+                f"{provider} circuit is unavailable."
             )
+
+        last_exception: Exception | None = None
 
         for attempt in range(
             self.retry.config.max_attempts
         ):
-
             started = time.perf_counter()
 
             try:
-
                 result = await operation()
 
-                elapsed = (
-                    time.perf_counter()
-                    - started
-                ) * 1000
+                elapsed_ms = (
+                    time.perf_counter() - started
+                ) * 1000.0
 
-                await breaker.on_success(elapsed)
+                await breaker.on_success(
+                    elapsed_ms
+                )
 
                 return result
 
             except Exception as exc:
+                last_exception = exc
 
-                message = str(exc)
+                elapsed_ms = (
+                    time.perf_counter() - started
+                ) * 1000.0
 
                 status = getattr(
                     exc,
@@ -391,57 +452,42 @@ class ProviderExecutor:
                     None,
                 )
 
-                retryable = False
-
-                if (
+                retryable = (
                     status is not None
                     and self.retry.should_retry_http(
-                        status
+                        int(status)
                     )
-                ):
-                    retryable = True
-
-                if self.retry.should_retry_exception(
+                ) or self.retry.should_retry_exception(
                     exc
-                ):
-                    retryable = True
-
-                if (
-                    attempt
-                    >= self.retry.config.max_attempts
-                    - 1
-                ):
-
-                    await breaker.on_failure(
-                        message
-                    )
-
-                    raise
-
-                if retryable:
-
-                    logger.warning(
-                        "%s retry %d/%d",
-                        provider,
-                        attempt + 1,
-                        self.retry.config.max_attempts,
-                    )
-
-                    await self.retry.sleep(
-                        attempt
-                    )
-
-                    continue
-
-                await breaker.on_failure(
-                    message
                 )
 
-                raise
+                final_attempt = (
+                    attempt
+                    >= self.retry.config.max_attempts - 1
+                )
+
+                if final_attempt or not retryable:
+                    await breaker.on_failure(
+                        str(exc),
+                        elapsed_ms,
+                    )
+                    raise
+
+                logger.warning(
+                    "%s retry %d/%d",
+                    provider,
+                    attempt + 1,
+                    self.retry.config.max_attempts,
+                )
+
+                await self.retry.sleep(attempt)
+
+        assert last_exception is not None
+        raise last_exception
 
 
 # ============================================================
-# GLOBAL SINGLETONS
+# GLOBALS
 # ============================================================
 
 CIRCUIT_REGISTRY = CircuitRegistry()
