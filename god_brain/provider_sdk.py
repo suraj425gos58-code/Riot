@@ -1,16 +1,7 @@
 """
 provider_sdk.py
 
-Foundational provider SDK for God Node.
-
-Purpose
--------
-This module defines the provider configuration schema and the adapter
-interfaces used by the routing engine.
-
-The router should only depend on these interfaces.
-
-No provider-specific logic belongs in this module.
+Provider-neutral configuration and adapter contracts.
 """
 
 from __future__ import annotations
@@ -20,8 +11,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Mapping, Optional, Sequence
 
-from connection_pool import HTTP_CLIENT
-from circuit_breaker import PROVIDER_EXECUTOR
+from .circuit_breaker import PROVIDER_EXECUTOR
+from .connection_pool import HTTP_CLIENT
 
 
 # ============================================================
@@ -48,39 +39,48 @@ class ProviderProtocol(str, Enum):
 
 @dataclass(slots=True)
 class PromptRequest:
-
     prompt: str
-
     system_prompt: Optional[str] = None
-
     temperature: float = 0.7
-
     max_tokens: Optional[int] = None
-
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        if not isinstance(self.prompt, str):
+            raise TypeError("prompt must be a string")
+
+        if not self.prompt.strip():
+            raise ValueError("prompt must not be empty")
+
+        if not 0.0 <= self.temperature <= 2.0:
+            raise ValueError(
+                "temperature must be between 0.0 and 2.0"
+            )
+
+        if (
+            self.max_tokens is not None
+            and self.max_tokens <= 0
+        ):
+            raise ValueError(
+                "max_tokens must be > 0"
+            )
 
 
 @dataclass(slots=True)
 class ProviderResponse:
-
     success: bool
-
     provider: str
-
     output: str
-
     raw_response: Optional[Any] = None
-
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 # ============================================================
-# AUTHENTICATION
+# AUTH
 # ============================================================
 
 @dataclass(slots=True)
 class AuthenticationConfig:
-
     type: AuthenticationType = AuthenticationType.BEARER
 
     token: Optional[str] = None
@@ -91,16 +91,45 @@ class AuthenticationConfig:
 
     prefix: str = "Bearer"
 
-    custom_headers: Dict[str, str] = field(default_factory=dict)
+    custom_headers: Dict[str, str] = field(
+        default_factory=dict
+    )
+
+    def validate(self) -> None:
+        if not self.header_name.strip():
+            raise ValueError(
+                "header_name must not be empty"
+            )
+
+        if (
+            self.type
+            in {
+                AuthenticationType.BEARER,
+                AuthenticationType.API_KEY_HEADER,
+                AuthenticationType.API_KEY_QUERY,
+            }
+            and not self.token
+        ):
+            raise ValueError(
+                f"token is required for auth type "
+                f"{self.type.value}"
+            )
+
+        if (
+            self.type == AuthenticationType.API_KEY_QUERY
+            and not self.query_name.strip()
+        ):
+            raise ValueError(
+                "query_name is required for API_KEY_QUERY"
+            )
 
 
 # ============================================================
-# PAYLOAD MAPPING
+# PAYLOAD
 # ============================================================
 
 @dataclass(slots=True)
 class PayloadMapping:
-
     prompt_field: str = "prompt"
 
     system_field: Optional[str] = None
@@ -111,17 +140,36 @@ class PayloadMapping:
 
     metadata_field: Optional[str] = None
 
-    fixed_fields: Dict[str, Any] = field(default_factory=dict)
+    fixed_fields: Dict[str, Any] = field(
+        default_factory=dict
+    )
 
+    def validate(self) -> None:
+        if not self.prompt_field.strip():
+            raise ValueError(
+                "prompt_field must not be empty"
+            )
 
-# ============================================================
-# RESPONSE MAPPING
-# ============================================================
 
 @dataclass(slots=True)
 class ResponseMapping:
+    output_path: Sequence[str] = field(
+        default_factory=lambda: ("output",)
+    )
 
-    output_path: Sequence[str] = field(default_factory=lambda: ("output",))
+    def validate(self) -> None:
+        if not self.output_path:
+            raise ValueError(
+                "output_path must not be empty"
+            )
+
+        if any(
+            not isinstance(part, str) or not part
+            for part in self.output_path
+        ):
+            raise ValueError(
+                "output_path must contain valid string keys"
+            )
 
 
 # ============================================================
@@ -130,12 +178,12 @@ class ResponseMapping:
 
 @dataclass(slots=True)
 class ProviderConfiguration:
-
     name: str
-
     endpoint: str
 
-    protocol: ProviderProtocol = ProviderProtocol.REST
+    protocol: ProviderProtocol = (
+        ProviderProtocol.REST
+    )
 
     enabled: bool = True
 
@@ -161,18 +209,45 @@ class ProviderConfiguration:
         default_factory=dict
     )
 
+    def validate(self) -> None:
+        if not self.name.strip():
+            raise ValueError(
+                "provider name must not be empty"
+            )
+
+        if not self.endpoint.strip():
+            raise ValueError(
+                "provider endpoint must not be empty"
+            )
+
+        if not (
+            self.endpoint.startswith("http://")
+            or self.endpoint.startswith("https://")
+        ):
+            raise ValueError(
+                "provider endpoint must be HTTP(S)"
+            )
+
+        if self.timeout_seconds <= 0:
+            raise ValueError(
+                "timeout_seconds must be > 0"
+            )
+
+        self.authentication.validate()
+        self.payload.validate()
+        self.response.validate()
+
 
 # ============================================================
-# ADAPTER CONTRACT
+# ADAPTER
 # ============================================================
 
 class ProviderAdapter(ABC):
-
     def __init__(
         self,
         configuration: ProviderConfiguration,
-    ):
-
+    ) -> None:
+        configuration.validate()
         self.configuration = configuration
 
     @property
@@ -207,13 +282,12 @@ class ProviderAdapter(ABC):
 
 
 # ============================================================
-# BASE IMPLEMENTATION
+# BASE REST ADAPTER
 # ============================================================
 
 class BaseRESTAdapter(ProviderAdapter):
 
     def build_headers(self) -> Dict[str, str]:
-
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -227,15 +301,16 @@ class BaseRESTAdapter(ProviderAdapter):
 
         if auth.type == AuthenticationType.BEARER:
             if auth.token:
-                headers[
-                    auth.header_name
-                ] = f"{auth.prefix} {auth.token}"
+                headers[auth.header_name] = (
+                    f"{auth.prefix} {auth.token}"
+                )
 
-        elif auth.type == AuthenticationType.API_KEY_HEADER:
+        elif (
+            auth.type
+            == AuthenticationType.API_KEY_HEADER
+        ):
             if auth.token:
-                headers[
-                    auth.header_name
-                ] = auth.token
+                headers[auth.header_name] = auth.token
 
         headers.update(auth.custom_headers)
 
@@ -245,6 +320,7 @@ class BaseRESTAdapter(ProviderAdapter):
         self,
         request: PromptRequest,
     ) -> Dict[str, Any]:
+        request.validate()
 
         mapping = self.configuration.payload
 
@@ -258,9 +334,9 @@ class BaseRESTAdapter(ProviderAdapter):
             mapping.system_field
             and request.system_prompt
         ):
-            payload[
-                mapping.system_field
-            ] = request.system_prompt
+            payload[mapping.system_field] = (
+                request.system_prompt
+            )
 
         if mapping.temperature_field:
             payload[
@@ -269,7 +345,7 @@ class BaseRESTAdapter(ProviderAdapter):
 
         if (
             mapping.max_tokens_field
-            and request.max_tokens
+            and request.max_tokens is not None
         ):
             payload[
                 mapping.max_tokens_field
@@ -285,12 +361,30 @@ class BaseRESTAdapter(ProviderAdapter):
 
         return payload
 
+    def build_query_params(self) -> Dict[str, str]:
+        auth = self.configuration.authentication
+
+        if (
+            auth.type
+            == AuthenticationType.API_KEY_QUERY
+        ):
+            if not auth.token:
+                raise ValueError(
+                    "API query authentication requires token"
+                )
+
+            return {
+                auth.query_name: auth.token
+            }
+
+        return {}
+
     async def invoke(
         self,
         request: PromptRequest,
     ) -> ProviderResponse:
         raise NotImplementedError(
-            "Concrete adapters implement invoke()."
+            "Concrete adapters must implement invoke()."
         )
 
 
@@ -299,9 +393,7 @@ class BaseRESTAdapter(ProviderAdapter):
 # ============================================================
 
 class ProviderRegistry:
-
-    def __init__(self):
-
+    def __init__(self) -> None:
         self._configs: Dict[
             str,
             ProviderConfiguration,
@@ -317,53 +409,63 @@ class ProviderRegistry:
         configuration: ProviderConfiguration,
         adapter: type[ProviderAdapter],
     ) -> None:
+        configuration.validate()
 
-        self._configs[
-            configuration.name
-        ] = configuration
+        if not issubclass(
+            adapter,
+            ProviderAdapter,
+        ):
+            raise TypeError(
+                "adapter must subclass ProviderAdapter"
+            )
 
-        self._adapters[
-            configuration.name
-        ] = adapter
+        self._configs[configuration.name] = (
+            configuration
+        )
 
-    def unregister(
-        self,
-        provider: str,
-    ) -> None:
+        self._adapters[configuration.name] = adapter
 
+    def unregister(self, provider: str) -> None:
         self._configs.pop(provider, None)
         self._adapters.pop(provider, None)
 
-    def exists(
-        self,
-        provider: str,
-    ) -> bool:
-
+    def exists(self, provider: str) -> bool:
         return provider in self._configs
 
     def configuration(
         self,
         provider: str,
     ) -> ProviderConfiguration:
-
-        return self._configs[provider]
+        try:
+            return self._configs[provider]
+        except KeyError as exc:
+            raise KeyError(
+                f"Unknown provider: {provider}"
+            ) from exc
 
     def create(
         self,
         provider: str,
     ) -> ProviderAdapter:
+        configuration = self.configuration(
+            provider
+        )
 
-        configuration = self._configs[provider]
-
-        adapter_cls = self._adapters[provider]
+        try:
+            adapter_cls = self._adapters[provider]
+        except KeyError as exc:
+            raise KeyError(
+                f"No adapter registered for provider: {provider}"
+            ) from exc
 
         return adapter_cls(configuration)
 
-    def providers(self) -> Mapping[
+    def providers(
+        self,
+    ) -> Mapping[
         str,
         ProviderConfiguration,
     ]:
-
         return dict(self._configs)
 
 
