@@ -1,19 +1,7 @@
 """
 connection_pool.py
 
-Enterprise-grade HTTP Connection Pool & TTL Cache
-
-Features
---------
-- Shared aiohttp.ClientSession
-- TCP connection pooling
-- DNS cache
-- HTTP keep-alive
-- Graceful startup / shutdown
-- Async-safe TTL cache
-- Model discovery cache
-- Generic async cache API
-- Production logging
+Shared HTTP infrastructure and bounded async TTL/LRU cache.
 """
 
 from __future__ import annotations
@@ -22,8 +10,9 @@ import asyncio
 import logging
 import ssl
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Dict, Generic, Optional, TypeVar
+from typing import Generic, Optional, TypeVar
 
 import aiohttp
 
@@ -33,7 +22,7 @@ T = TypeVar("T")
 
 
 # ============================================================
-# TTL CACHE
+# CACHE
 # ============================================================
 
 @dataclass(slots=True)
@@ -44,28 +33,55 @@ class CacheEntry(Generic[T]):
 
 class AsyncTTLCache(Generic[T]):
     """
-    Async-safe in-memory TTL cache.
+    Async-safe bounded LRU + TTL cache.
 
-    Thread-safe for asyncio applications.
+    Guarantees:
+    - bounded number of entries
+    - TTL expiration
+    - LRU eviction
+    - asyncio-safe access
+    - explicit zero/negative TTL handling
     """
 
-    def __init__(self, ttl_seconds: int = 3600):
+    def __init__(
+        self,
+        ttl_seconds: int = 3600,
+        max_entries: int = 512,
+    ) -> None:
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be > 0")
+
+        if max_entries <= 0:
+            raise ValueError("max_entries must be > 0")
+
         self._ttl = ttl_seconds
-        self._cache: Dict[str, CacheEntry[T]] = {}
+        self._max_entries = max_entries
+        self._cache: OrderedDict[str, CacheEntry[T]] = OrderedDict()
         self._lock = asyncio.Lock()
 
-    async def get(self, key: str) -> Optional[T]:
-        async with self._lock:
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+        self._expirations = 0
 
+    async def get(self, key: str) -> Optional[T]:
+        now = time.monotonic()
+
+        async with self._lock:
             entry = self._cache.get(key)
 
             if entry is None:
+                self._misses += 1
                 return None
 
-            if entry.expires_at <= time.time():
+            if entry.expires_at <= now:
                 self._cache.pop(key, None)
+                self._expirations += 1
+                self._misses += 1
                 return None
 
+            self._cache.move_to_end(key)
+            self._hits += 1
             return entry.value
 
     async def set(
@@ -74,14 +90,25 @@ class AsyncTTLCache(Generic[T]):
         value: T,
         ttl: Optional[int] = None,
     ) -> None:
+        effective_ttl = self._ttl if ttl is None else ttl
 
-        expiration = time.time() + (ttl or self._ttl)
+        if effective_ttl <= 0:
+            await self.delete(key)
+            return
+
+        expiration = time.monotonic() + effective_ttl
 
         async with self._lock:
             self._cache[key] = CacheEntry(
                 value=value,
                 expires_at=expiration,
             )
+
+            self._cache.move_to_end(key)
+
+            while len(self._cache) > self._max_entries:
+                self._cache.popitem(last=False)
+                self._evictions += 1
 
     async def delete(self, key: str) -> None:
         async with self._lock:
@@ -92,25 +119,40 @@ class AsyncTTLCache(Generic[T]):
             self._cache.clear()
 
     async def contains(self, key: str) -> bool:
-        return await self.get(key) is not None
+        value = await self.get(key)
+        return value is not None
 
-    async def cleanup(self) -> None:
-        now = time.time()
+    async def cleanup(self) -> int:
+        now = time.monotonic()
 
         async with self._lock:
-
-            expired = [
+            expired_keys = [
                 key
-                for key, value in self._cache.items()
-                if value.expires_at <= now
+                for key, entry in self._cache.items()
+                if entry.expires_at <= now
             ]
 
-            for key in expired:
+            for key in expired_keys:
                 self._cache.pop(key, None)
+
+            self._expirations += len(expired_keys)
+
+            return len(expired_keys)
 
     async def size(self) -> int:
         async with self._lock:
             return len(self._cache)
+
+    async def stats(self) -> dict[str, int]:
+        async with self._lock:
+            return {
+                "size": len(self._cache),
+                "max_entries": self._max_entries,
+                "hits": self._hits,
+                "misses": self._misses,
+                "evictions": self._evictions,
+                "expirations": self._expirations,
+            }
 
 
 # ============================================================
@@ -119,16 +161,11 @@ class AsyncTTLCache(Generic[T]):
 
 class SharedHTTPClient:
     """
-    Global reusable aiohttp session.
+    Single process-wide aiohttp ClientSession.
 
-    Use:
-
+    Lifecycle:
         await SharedHTTPClient.startup()
-
         session = SharedHTTPClient.session()
-
-        ...
-
         await SharedHTTPClient.shutdown()
     """
 
@@ -144,12 +181,10 @@ class SharedHTTPClient:
 
     @classmethod
     async def startup(cls) -> None:
-
         if cls._session is not None:
             return
 
         async with cls._lock:
-
             if cls._session is not None:
                 return
 
@@ -181,27 +216,31 @@ class SharedHTTPClient:
 
     @classmethod
     async def shutdown(cls) -> None:
-
         async with cls._lock:
+            session = cls._session
 
-            if cls._session is None:
+            if session is None:
                 return
 
-            await cls._session.close()
-
             cls._session = None
+
+            try:
+                await session.close()
+            except Exception:
+                logger.exception("Failed to close shared HTTP session.")
 
             logger.info("Shared HTTP session closed.")
 
     @classmethod
     def session(cls) -> aiohttp.ClientSession:
+        session = cls._session
 
-        if cls._session is None:
+        if session is None:
             raise RuntimeError(
                 "SharedHTTPClient.startup() has not been called."
             )
 
-        return cls._session
+        return session
 
     @classmethod
     def initialized(cls) -> bool:
@@ -209,33 +248,30 @@ class SharedHTTPClient:
 
 
 # ============================================================
-# MODEL DISCOVERY CACHE
+# MODEL CACHE
 # ============================================================
 
 class ModelCache:
     """
-    Provider model cache.
+    Provider model discovery cache.
 
-    Example:
-
-        cache = ModelCache()
-
-        await cache.set_models(
-            "openai",
-            ["gpt-5","gpt-4.1"],
-        )
-
-        models = await cache.get_models("openai")
+    Bounded so provider discovery cannot grow memory forever.
     """
 
-    def __init__(self, ttl_seconds: int = 3600):
-        self._cache = AsyncTTLCache[list[str]](ttl_seconds)
+    def __init__(
+        self,
+        ttl_seconds: int = 3600,
+        max_providers: int = 128,
+    ) -> None:
+        self._cache = AsyncTTLCache[list[str]](
+            ttl_seconds=ttl_seconds,
+            max_entries=max_providers,
+        )
 
     async def get_models(
         self,
         provider: str,
     ) -> Optional[list[str]]:
-
         return await self._cache.get(provider)
 
     async def set_models(
@@ -244,45 +280,45 @@ class ModelCache:
         models: list[str],
         ttl: Optional[int] = None,
     ) -> None:
-
+        # Store a copy so callers cannot mutate cached state externally.
         await self._cache.set(
             provider,
-            models,
+            list(models),
             ttl,
         )
 
-    async def invalidate(
-        self,
-        provider: str,
-    ) -> None:
-
+    async def invalidate(self, provider: str) -> None:
         await self._cache.delete(provider)
 
     async def clear(self) -> None:
         await self._cache.clear()
 
+    async def cleanup(self) -> int:
+        return await self._cache.cleanup()
+
+    async def stats(self) -> dict[str, int]:
+        return await self._cache.stats()
+
 
 # ============================================================
-# GLOBAL SINGLETONS
+# SINGLETONS
 # ============================================================
 
-MODEL_CACHE = ModelCache(ttl_seconds=3600)
+MODEL_CACHE = ModelCache(
+    ttl_seconds=3600,
+    max_providers=128,
+)
+
 HTTP_CLIENT = SharedHTTPClient
 
 
 # ============================================================
-# OPTIONAL LIFECYCLE HELPERS
+# LIFECYCLE
 # ============================================================
 
 async def startup() -> None:
-    """
-    Call from FastAPI startup event.
-    """
     await HTTP_CLIENT.startup()
 
 
 async def shutdown() -> None:
-    """
-    Call from FastAPI shutdown event.
-    """
     await HTTP_CLIENT.shutdown()
