@@ -34,6 +34,7 @@ Responsibilities
 from __future__ import annotations
 
 import hashlib
+import hmac
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -221,23 +222,69 @@ def _target_capabilities(
         },
     }
 
-    return common | platform_capabilities[target]
+    try:
+        return common | platform_capabilities[target]
+    except KeyError as exc:
+        raise UnsupportedRuntimeTargetError(
+            f"Unsupported target platform: {target!r}"
+        ) from exc
 
 
 def _source_reference(
     path: str,
     *,
+    content: str | bytes,
     checksum: Optional[str],
     size_bytes: int,
     kind: str,
     media_type: Optional[str] = None,
 ) -> RuntimeArtifactReference:
+    """
+    Create an artifact reference only after verifying the supplied
+    checksum against the actual artifact content.
+
+    `verified=True` is therefore evidence-backed rather than asserted.
+    """
+    if isinstance(content, str):
+        payload = content.encode("utf-8")
+    else:
+        payload = bytes(content)
+
+    calculated_checksum = hashlib.sha256(
+        payload
+    ).hexdigest()
+
+    declared_checksum = (
+        str(checksum).strip().lower()
+        if checksum
+        else ""
+    )
+
+    if declared_checksum:
+        if not hmac.compare_digest(
+            declared_checksum,
+            calculated_checksum,
+        ):
+            raise RuntimeCompilerValidationError(
+                "artifact checksum mismatch for "
+                f"{path!r}: declared={declared_checksum!r}, "
+                f"calculated={calculated_checksum!r}"
+            )
+
+        verified_checksum = declared_checksum
+        verified = True
+    else:
+        # The content was hashed, but there was no producer-supplied
+        # checksum to validate against. Do not fabricate verification.
+        verified_checksum = calculated_checksum
+        verified = False
+
     return RuntimeArtifactReference(
         kind=kind,
         path=path,
-        checksum=checksum,
+        checksum=verified_checksum,
         size_bytes=size_bytes,
-        verified=True,
+        verified=verified,
         media_type=media_type,
     )
 
@@ -361,7 +408,10 @@ class RuntimeCompiler:
                     "runtime_type": (
                         target.runtime_type.value
                     ),
-                    "dependency_order": list(
+                    "pipeline_order": list(
+                        graph.topological_order
+                    ),
+                    "topological_order": list(
                         graph.topological_order
                     ),
                     "parallel_levels": [
@@ -584,7 +634,7 @@ class RuntimeCompiler:
                 owner="director",
                 depends_on=[],
                 required_capabilities={
-                    "runtime_execution",
+                    "project_planning",
                 },
                 expected_outputs=[
                     "architecture_plan",
@@ -607,7 +657,7 @@ class RuntimeCompiler:
                     planning_id,
                 ],
                 required_capabilities={
-                    "runtime_execution",
+                    "asset_generation",
                 },
                 expected_outputs=[
                     "asset_manifest",
@@ -635,7 +685,7 @@ class RuntimeCompiler:
                     assets_id,
                 ],
                 required_capabilities={
-                    "runtime_execution",
+                    "world_generation",
                 },
                 expected_outputs=[
                     "world_manifest",
@@ -666,7 +716,7 @@ class RuntimeCompiler:
                     assets_id,
                 ],
                 required_capabilities={
-                    "runtime_execution",
+                    "scene_generation",
                 },
                 expected_outputs=[
                     "scene_graph",
@@ -696,7 +746,7 @@ class RuntimeCompiler:
                     scene_id,
                 ],
                 required_capabilities={
-                    "runtime_execution",
+                    "physics_simulation",
                 },
                 expected_outputs=[
                     "physics_config",
@@ -761,7 +811,7 @@ class RuntimeCompiler:
                     gameplay_id,
                 ],
                 required_capabilities={
-                    "runtime_execution",
+                    "runtime_assembly",
                 },
                 inputs=(
                     self._source_artifact_inputs(
@@ -795,7 +845,7 @@ class RuntimeCompiler:
                     assembly_id,
                 ],
                 required_capabilities={
-                    "runtime_execution",
+                    "qa_validation",
                 },
                 expected_outputs=[
                     "qa_report",
@@ -875,6 +925,7 @@ class RuntimeCompiler:
             result.append(
                 _source_reference(
                     path,
+                    content=source_file.content,
                     checksum=source_file.checksum,
                     size_bytes=len(
                         source_file.content.encode(
@@ -896,6 +947,7 @@ class RuntimeCompiler:
             result.append(
                 _source_reference(
                     path,
+                    content=binary_file.content,
                     checksum=binary_file.checksum,
                     size_bytes=len(
                         binary_file.content
@@ -925,11 +977,20 @@ class RuntimeCompiler:
             f"runtime_{project.project_id}"
         )
 
-        dependencies = list(
+        pipeline_order = tuple(
             graph.topological_order
         )
 
-        if len(dependencies) > MAX_DEPENDENCIES:
+        qa_id = self._stage_id(
+            project,
+            "qa",
+        )
+
+        execution_dependencies = [
+            qa_id
+        ]
+
+        if len(execution_dependencies) > MAX_DEPENDENCIES:
             raise RuntimeCompilerValidationError(
                 "runtime dependency count exceeds configured limit"
             )
@@ -950,7 +1011,7 @@ class RuntimeCompiler:
             required_capabilities=set(
                 target.capabilities
             ),
-            dependencies=dependencies,
+            dependencies=execution_dependencies,
             input_artifacts=(
                 self._source_artifact_inputs(
                     project
@@ -962,11 +1023,17 @@ class RuntimeCompiler:
                     stage.stage_id
                     for stage in stages
                 ],
-                "dependency_levels": [
+                "pipeline_order": list(
+                    pipeline_order
+                ),
+                "dependency_graph_levels": [
                     list(level)
                     for level
                     in graph.levels
                 ],
+                "execution_dependencies": list(
+                    execution_dependencies
+                ),
                 "project_seed": project.seed,
                 "entry_point": (
                     project.source_bundle.entry_point
