@@ -10,9 +10,9 @@ Existing specialist agents may continue to call:
     super().__init__(role_name="...", service_type="brain")
     await/self.think_and_execute(...)
 
-The base class now:
+The base class:
 * uses an injected/process-local GatewayRouter instance correctly;
-* never calls provider retry logic itself;
+* never performs provider retry logic itself;
 * bounds prompt/context/output sizes;
 * supports async and sync gateway implementations;
 * validates JSON without fabricating missing data;
@@ -20,7 +20,12 @@ The base class now:
 * supports response-schema validation through Pydantic-like contracts;
 * propagates cancellation and hard timeouts;
 * supports bounded parallel execution;
-* avoids blocking the asyncio event loop on synchronous providers.
+* avoids blocking the asyncio event loop on synchronous providers;
+* uses collision-resistant request IDs;
+* keeps telemetry counters thread-safe;
+* avoids swallowing real TypeError exceptions raised inside gateway code;
+* rejects oversized structured output instead of truncating valid JSON into
+  invalid JSON.
 
 It intentionally does not perform hidden second requests when model output is
 malformed. Provider retry/failover remains the gateway/provider responsibility.
@@ -37,6 +42,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -46,6 +52,7 @@ from core.gateway import GatewayRouter
 
 
 logger = logging.getLogger("Riot.AgentRuntime")
+
 if not logger.handlers:
     handler = logging.StreamHandler()
     handler.setFormatter(
@@ -54,49 +61,94 @@ if not logger.handlers:
         )
     )
     logger.addHandler(handler)
-logger.setLevel(os.getenv("RIOT_AGENT_LOG_LEVEL", "INFO").upper())
+
+logger.setLevel(
+    os.getenv("RIOT_AGENT_LOG_LEVEL", "INFO").upper()
+)
 
 
 T = TypeVar("T")
+
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+def _env_int(
+    name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
     try:
         value = int(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         value = default
+
     return min(maximum, max(minimum, value))
 
 
-def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+def _env_float(
+    name: str,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
     try:
         value = float(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         value = default
+
     return min(maximum, max(minimum, value))
 
 
 DEFAULT_MAX_PROMPT_CHARS = _env_int(
-    "RIOT_AGENT_MAX_PROMPT_CHARS", 180_000, 4_096, 2_000_000
+    "RIOT_AGENT_MAX_PROMPT_CHARS",
+    180_000,
+    4_096,
+    2_000_000,
 )
+
 DEFAULT_MAX_CONTEXT_CHARS = _env_int(
-    "RIOT_AGENT_MAX_CONTEXT_CHARS", 220_000, 4_096, 2_000_000
+    "RIOT_AGENT_MAX_CONTEXT_CHARS",
+    220_000,
+    4_096,
+    2_000_000,
 )
+
 DEFAULT_MAX_OUTPUT_CHARS = _env_int(
-    "RIOT_AGENT_MAX_OUTPUT_CHARS", 500_000, 4_096, 4_000_000
+    "RIOT_AGENT_MAX_OUTPUT_CHARS",
+    500_000,
+    4_096,
+    4_000_000,
 )
+
 DEFAULT_TIMEOUT_SECONDS = _env_float(
-    "RIOT_AGENT_TIMEOUT_SECONDS", 300.0, 5.0, 1_800.0
+    "RIOT_AGENT_TIMEOUT_SECONDS",
+    300.0,
+    5.0,
+    1_800.0,
 )
-DEFAULT_HISTORY_SIZE = _env_int("RIOT_AGENT_HISTORY_SIZE", 64, 8, 512)
+
+DEFAULT_HISTORY_SIZE = _env_int(
+    "RIOT_AGENT_HISTORY_SIZE",
+    64,
+    8,
+    512,
+)
+
 DEFAULT_MAX_CONCURRENCY = _env_int(
-    "RIOT_MAX_AGENT_CONCURRENCY_PER_INSTANCE", 8, 1, 128
+    "RIOT_MAX_AGENT_CONCURRENCY_PER_INSTANCE",
+    8,
+    1,
+    128,
 )
+
 _DEFAULT_MAX_PARALLEL_BATCH = _env_int(
-    "RIOT_AGENT_MAX_PARALLEL_BATCH", 64, 1, 512
+    "RIOT_AGENT_MAX_PARALLEL_BATCH",
+    64,
+    1,
+    512,
 )
 
 
@@ -109,16 +161,26 @@ class AgentRuntimeConfig:
     history_size: int = DEFAULT_HISTORY_SIZE
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY
     max_parallel_batch: int = _DEFAULT_MAX_PARALLEL_BATCH
-    temperature: float = _env_float("RIOT_AGENT_TEMPERATURE", 0.2, 0.0, 2.0)
+    temperature: float = _env_float(
+        "RIOT_AGENT_TEMPERATURE",
+        0.2,
+        0.0,
+        2.0,
+    )
     max_tokens: Optional[int] = (
-        _env_int("RIOT_AGENT_MAX_TOKENS", 12_000, 256, 64_000)
+        _env_int(
+            "RIOT_AGENT_MAX_TOKENS",
+            12_000,
+            256,
+            64_000,
+        )
         if os.getenv("RIOT_AGENT_MAX_TOKENS") is not None
         else None
     )
 
 
 # ---------------------------------------------------------------------------
-# Typed-ish execution contracts
+# Typed execution contracts
 # ---------------------------------------------------------------------------
 
 class AgentExecutionStatus(str, Enum):
@@ -196,7 +258,12 @@ class AgentResult:
 # Serialization / bounds
 # ---------------------------------------------------------------------------
 
-def _json_safe(value: Any, *, max_depth: int = 12, _depth: int = 0) -> Any:
+def _json_safe(
+    value: Any,
+    *,
+    max_depth: int = 12,
+    _depth: int = 0,
+) -> Any:
     if _depth > max_depth:
         return "<max-depth>"
 
@@ -208,17 +275,26 @@ def _json_safe(value: Any, *, max_depth: int = 12, _depth: int = 0) -> Any:
 
     if isinstance(value, Mapping):
         return {
-            str(key): _json_safe(item, max_depth=max_depth, _depth=_depth + 1)
+            str(key): _json_safe(
+                item,
+                max_depth=max_depth,
+                _depth=_depth + 1,
+            )
             for key, item in value.items()
         }
 
     if isinstance(value, (list, tuple, set, frozenset)):
         return [
-            _json_safe(item, max_depth=max_depth, _depth=_depth + 1)
+            _json_safe(
+                item,
+                max_depth=max_depth,
+                _depth=_depth + 1,
+            )
             for item in value
         ]
 
     model_dump = getattr(value, "model_dump", None)
+
     if callable(model_dump):
         try:
             return _json_safe(
@@ -230,6 +306,7 @@ def _json_safe(value: Any, *, max_depth: int = 12, _depth: int = 0) -> Any:
             pass
 
     to_dict = getattr(value, "to_dict", None)
+
     if callable(to_dict):
         try:
             return _json_safe(
@@ -256,16 +333,27 @@ def _canonical_json(value: Any) -> str:
 
 
 def _sha256_text(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        value.encode("utf-8")
+    ).hexdigest()
 
 
-def _bounded_text(value: Any, limit: int) -> str:
-    text = value if isinstance(value, str) else _canonical_json(value)
+def _bounded_text(
+    value: Any,
+    limit: int,
+) -> str:
+    text = (
+        value
+        if isinstance(value, str)
+        else _canonical_json(value)
+    )
+
     if len(text) <= limit:
         return text
 
     head = max(1, int(limit * 0.72))
     tail = max(1, limit - head - 80)
+
     return (
         text[:head]
         + "\n...[TRUNCATED BY AGENT INPUT BUDGET]...\n"
@@ -273,17 +361,26 @@ def _bounded_text(value: Any, limit: int) -> str:
     )
 
 
-def _normalize_context(context: Optional[Mapping[str, Any]]) -> dict[str, Any]:
+def _normalize_context(
+    context: Optional[Mapping[str, Any]],
+) -> dict[str, Any]:
     if not context:
         return {}
 
     safe = _json_safe(context)
+
     if isinstance(safe, Mapping):
-        return {str(key): value for key, value in safe.items()}
+        return {
+            str(key): value
+            for key, value in safe.items()
+        }
+
     return {"value": safe}
 
 
-def _extract_response_text(response: Any) -> tuple[str, Optional[str], dict[str, Any]]:
+def _extract_response_text(
+    response: Any,
+) -> tuple[str, Optional[str], dict[str, Any]]:
     provider: Optional[str] = None
     metadata: dict[str, Any] = {}
 
@@ -295,30 +392,64 @@ def _extract_response_text(response: Any) -> tuple[str, Optional[str], dict[str,
 
     if isinstance(response, Mapping):
         raw_provider = response.get("provider")
+
         if raw_provider is not None:
             provider = str(raw_provider)
 
         raw_metadata = response.get("metadata")
-        if isinstance(raw_metadata, Mapping):
-            metadata = _json_safe(raw_metadata)
 
-        for key in ("output", "text", "content", "result", "data"):
+        if isinstance(raw_metadata, Mapping):
+            safe_metadata = _json_safe(raw_metadata)
+
+            if isinstance(safe_metadata, Mapping):
+                metadata = dict(safe_metadata)
+
+        for key in (
+            "output",
+            "text",
+            "content",
+            "result",
+            "data",
+        ):
             if key not in response:
                 continue
+
             candidate = response[key]
+
             if isinstance(candidate, str):
                 return candidate, provider, metadata
+
             if isinstance(candidate, (Mapping, list, tuple)):
-                return _canonical_json(candidate), provider, metadata
+                return (
+                    _canonical_json(candidate),
+                    provider,
+                    metadata,
+                )
 
-        return _canonical_json(response), provider, metadata
+        return (
+            _canonical_json(response),
+            provider,
+            metadata,
+        )
 
-    for attr in ("output", "text", "content", "result", "data"):
+    for attr in (
+        "output",
+        "text",
+        "content",
+        "result",
+        "data",
+    ):
         candidate = getattr(response, attr, None)
+
         if candidate is not None:
             if isinstance(candidate, str):
                 return candidate, provider, metadata
-            return _canonical_json(candidate), provider, metadata
+
+            return (
+                _canonical_json(candidate),
+                provider,
+                metadata,
+            )
 
     return str(response), provider, metadata
 
@@ -342,6 +473,7 @@ class _GatewayHolder:
     def set_gateway(cls, gateway: Any) -> None:
         if gateway is None:
             raise ValueError("gateway cannot be None")
+
         with cls._lock:
             cls._gateway = gateway
 
@@ -350,6 +482,7 @@ class _GatewayHolder:
         with cls._lock:
             if cls._gateway is None:
                 cls._gateway = GatewayRouter()
+
             return cls._gateway
 
 
@@ -358,7 +491,9 @@ class AgentCapabilityProfile:
 
     role_name: str = "Generic Agent"
     service_type: str = "brain"
-    required_capabilities: frozenset[str] = frozenset({"text_generation"})
+    required_capabilities: frozenset[str] = frozenset(
+        {"text_generation"}
+    )
     preferred_temperature: Optional[float] = None
     default_task_timeout: Optional[float] = None
 
@@ -366,7 +501,9 @@ class AgentCapabilityProfile:
         return {
             "role_name": self.role_name,
             "service_type": self.service_type,
-            "required_capabilities": sorted(self.required_capabilities),
+            "required_capabilities": sorted(
+                self.required_capabilities
+            ),
             "preferred_temperature": self.preferred_temperature,
             "default_task_timeout": self.default_task_timeout,
         }
@@ -392,7 +529,9 @@ class GodBaseAgent(AgentCapabilityProfile):
 
     role_name: str = "Generic Agent"
     service_type: str = "brain"
-    required_capabilities: frozenset[str] = frozenset({"text_generation"})
+    required_capabilities: frozenset[str] = frozenset(
+        {"text_generation"}
+    )
 
     def __init__(
         self,
@@ -406,9 +545,21 @@ class GodBaseAgent(AgentCapabilityProfile):
         max_tokens: Optional[int] = None,
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> None:
-        self.role_name = str(role_name).strip() or "Unnamed Agent"
-        self.service_type = str(service_type).strip() or "brain"
-        self.config = config or AgentRuntimeConfig()
+        self.role_name = (
+            str(role_name).strip()
+            or "Unnamed Agent"
+        )
+
+        self.service_type = (
+            str(service_type).strip()
+            or "brain"
+        )
+
+        self.config = (
+            config
+            if isinstance(config, AgentRuntimeConfig)
+            else AgentRuntimeConfig()
+        )
 
         caps = (
             {
@@ -419,29 +570,47 @@ class GodBaseAgent(AgentCapabilityProfile):
             if required_capabilities is not None
             else set(self.required_capabilities)
         )
-        self.required_capabilities = frozenset(caps or {"text_generation"})
+
+        self.required_capabilities = frozenset(
+            caps or {"text_generation"}
+        )
 
         self.default_temperature = (
             self.config.temperature
             if temperature is None
-            else max(0.0, min(2.0, float(temperature)))
+            else max(
+                0.0,
+                min(2.0, float(temperature)),
+            )
         )
+
         self.default_max_tokens = (
             self.config.max_tokens
             if max_tokens is None
             else max(1, int(max_tokens))
         )
-        self.agent_metadata = dict(metadata or {})
+
+        self.agent_metadata = dict(
+            metadata or {}
+        )
 
         self._gateway = gateway
+
         if gateway is not None:
             _GatewayHolder.set_gateway(gateway)
 
-        self._concurrency = asyncio.Semaphore(self.config.max_concurrency)
-        self._history: Deque[AgentExecutionRecord] = deque(
+        self._concurrency = asyncio.Semaphore(
+            self.config.max_concurrency
+        )
+
+        self._history: Deque[
+            AgentExecutionRecord
+        ] = deque(
             maxlen=self.config.history_size
         )
+
         self._history_lock = threading.RLock()
+        self._stats_lock = threading.RLock()
 
         self._invocations = 0
         self._successes = 0
@@ -460,6 +629,7 @@ class GodBaseAgent(AgentCapabilityProfile):
     def gateway(self) -> Any:
         if self._gateway is None:
             self._gateway = _GatewayHolder.get_gateway()
+
         return self._gateway
 
     def set_gateway(self, gateway: Any) -> None:
@@ -470,23 +640,112 @@ class GodBaseAgent(AgentCapabilityProfile):
         """
         Return a real GatewayHandle/service handle.
 
-        The previous implementation called GatewayRouter.get_gateway as if it
-        were a class method. This version first resolves the actual router
-        instance and then requests its service handle.
+        The gateway is resolved from the actual router instance.  This keeps
+        agent execution compatible with the canonical singleton gateway while
+        still supporting simple gateway-like objects in tests.
         """
         router = self.gateway
-        get_gateway = getattr(router, "get_gateway", None)
+
+        get_gateway = getattr(
+            router,
+            "get_gateway",
+            None,
+        )
+
         if get_gateway is None:
             if hasattr(router, "generate"):
                 return router
+
             raise RuntimeError(
-                "Configured gateway exposes neither get_gateway() nor generate()"
+                "Configured gateway exposes neither "
+                "get_gateway() nor generate()"
             )
 
+        return self._invoke_callable_with_supported_kwargs(
+            get_gateway,
+            {
+                "service_type": self.service_type,
+            },
+            positional_fallback=(self.service_type,),
+        )
+
+    # ------------------------------------------------------------------
+    # Generic callable signature support
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _callable_accepts_keyword(
+        callable_obj: Any,
+        keyword: str,
+    ) -> bool:
         try:
-            return get_gateway(service_type=self.service_type)
+            signature = inspect.signature(
+                callable_obj
+            )
+        except (TypeError, ValueError):
+            return True
+
+        parameters = signature.parameters
+
+        if keyword in parameters:
+            return True
+
+        return any(
+            parameter.kind
+            is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
+    @classmethod
+    def _filter_supported_kwargs(
+        cls,
+        callable_obj: Any,
+        kwargs: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            signature = inspect.signature(
+                callable_obj
+            )
+        except (TypeError, ValueError):
+            return dict(kwargs)
+
+        parameters = signature.parameters
+
+        accepts_var_kwargs = any(
+            parameter.kind
+            is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
+        if accepts_var_kwargs:
+            return dict(kwargs)
+
+        return {
+            key: value
+            for key, value in kwargs.items()
+            if key in parameters
+        }
+
+    @classmethod
+    def _invoke_callable_with_supported_kwargs(
+        cls,
+        callable_obj: Any,
+        kwargs: Mapping[str, Any],
+        *,
+        positional_fallback: Optional[tuple[Any, ...]] = None,
+    ) -> Any:
+        filtered = cls._filter_supported_kwargs(
+            callable_obj,
+            kwargs,
+        )
+
+        try:
+            return callable_obj(**filtered)
         except TypeError:
-            return get_gateway(self.service_type)
+            if positional_fallback is None:
+                raise
+
+            return callable_obj(*positional_fallback)
 
     # ------------------------------------------------------------------
     # Prompt construction
@@ -502,41 +761,79 @@ class GodBaseAgent(AgentCapabilityProfile):
             str(task_directive or "").strip(),
             self.config.max_prompt_chars,
         )
-        normalized_context = _normalize_context(context)
+
+        normalized_context = _normalize_context(
+            context
+        )
+
         context_text = _bounded_text(
             normalized_context,
             self.config.max_context_chars,
         )
 
         parts = [
-            f"You are the {self.role_name} inside the Riot / God Node game-generation engine.",
-            "You are a specialist production agent. Your response is consumed by downstream software.",
+            (
+                f"You are the {self.role_name} inside the "
+                "Riot / God Node game-generation engine."
+            ),
+            (
+                "You are a specialist production agent. "
+                "Your response is consumed by downstream software."
+            ),
             "",
             "ROLE PROFILE:",
-            _canonical_json(self.profile_dict()),
+            _canonical_json(
+                self.profile_dict()
+            ),
             "",
             "NON-NEGOTIABLE ENGINE RULES:",
-            "1. Preserve upstream information and dependencies.",
-            "2. Never invent assets, files, coordinates, providers, tests, builds, or artifacts.",
-            "3. Separate plan/recommendation from verified/generated evidence.",
-            "4. Do not claim execution, compilation, rendering, QA, or artifact creation without evidence.",
-            "5. Optimize outputs for deterministic downstream processing and bounded resource use.",
-            "6. Return one machine-readable JSON object only; no Markdown and no conversational prose.",
+            (
+                "1. Preserve upstream information and dependencies."
+            ),
+            (
+                "2. Never invent assets, files, coordinates, providers, "
+                "tests, builds, or artifacts."
+            ),
+            (
+                "3. Separate plan/recommendation from verified/generated evidence."
+            ),
+            (
+                "4. Do not claim execution, compilation, rendering, QA, "
+                "or artifact creation without evidence."
+            ),
+            (
+                "5. Optimize outputs for deterministic downstream "
+                "processing and bounded resource use."
+            ),
+            (
+                "6. Return one machine-readable JSON object only; "
+                "no Markdown and no conversational prose."
+            ),
             "",
             "DIRECTIVE:",
             directive,
         ]
 
         if context_text != "{}":
-            parts.extend(["", "UPSTREAM CONTEXT:", context_text])
+            parts.extend(
+                [
+                    "",
+                    "UPSTREAM CONTEXT:",
+                    context_text,
+                ]
+            )
 
         parts.extend(
             [
                 "",
                 "OUTPUT CONTRACT:",
-                '{"status":"SUCCESS|FAILED","data":{...},"warnings":[],"errors":[]}',
+                (
+                    '{"status":"SUCCESS|FAILED",'
+                    '"data":{...},"warnings":[],"errors":[]}'
+                ),
             ]
         )
+
         return "\n".join(parts)
 
     def create_request(
@@ -550,23 +847,28 @@ class GodBaseAgent(AgentCapabilityProfile):
         required_capabilities: Optional[Iterable[str]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> AgentRequest:
-        directive = str(task_directive or "").strip()
-        if not directive:
-            raise ValueError("task_directive cannot be empty")
+        directive = str(
+            task_directive or ""
+        ).strip()
 
-        normalized_context = _normalize_context(context)
+        if not directive:
+            raise ValueError(
+                "task_directive cannot be empty"
+            )
+
+        normalized_context = _normalize_context(
+            context
+        )
+
         system_prompt = self.build_system_prompt(
             directive,
             context=normalized_context,
         )
 
-        material = (
-            f"{self.role_name}\x1f{self.service_type}\x1f"
-            f"{time.time_ns()}\x1f{directive}"
-        )
+        # Phase 5: use UUID4 rather than timestamp/SHA1 construction.
+        # This avoids unnecessary hashing and greatly reduces collision risk.
         request_id = (
-            f"agent_{time.time_ns()}_"
-            f"{hashlib.sha1(material.encode('utf-8')).hexdigest()[:12]}"
+            f"agent_{uuid.uuid4().hex}"
         )
 
         caps = (
@@ -579,9 +881,20 @@ class GodBaseAgent(AgentCapabilityProfile):
             else self.required_capabilities
         )
 
-        request_metadata = dict(self.agent_metadata)
+        request_metadata = dict(
+            self.agent_metadata
+        )
+
         if metadata:
-            request_metadata.update(_json_safe(metadata))
+            safe_metadata = _json_safe(
+                metadata
+            )
+
+            if isinstance(safe_metadata, Mapping):
+                request_metadata.update(
+                    safe_metadata
+                )
+
         request_metadata.update(
             {
                 "agent_role": self.role_name,
@@ -593,7 +906,13 @@ class GodBaseAgent(AgentCapabilityProfile):
         timeout = (
             self.config.timeout_seconds
             if timeout_seconds is None
-            else max(5.0, min(1_800.0, float(timeout_seconds)))
+            else max(
+                5.0,
+                min(
+                    1_800.0,
+                    float(timeout_seconds),
+                ),
+            )
         )
 
         return AgentRequest(
@@ -606,7 +925,10 @@ class GodBaseAgent(AgentCapabilityProfile):
             temperature=(
                 self.default_temperature
                 if temperature is None
-                else max(0.0, min(2.0, float(temperature)))
+                else max(
+                    0.0,
+                    min(2.0, float(temperature)),
+                )
             ),
             max_tokens=(
                 self.default_max_tokens
@@ -622,40 +944,76 @@ class GodBaseAgent(AgentCapabilityProfile):
     # Output sanitation / parsing
     # ------------------------------------------------------------------
 
-    def _sanitize_json(self, raw_text: str) -> str:
+    def _sanitize_json(
+        self,
+        raw_text: str,
+    ) -> str:
         """
         Remove only common transport wrappers.
 
-        The method deliberately avoids speculative JSON repair so corrupted
-        model output becomes an explicit INVALID_OUTPUT result.
+        This deliberately avoids speculative JSON repair.
         """
-        clean = str(raw_text or "").strip().lstrip("\ufeff")
+        clean = (
+            str(raw_text or "")
+            .strip()
+            .lstrip("\ufeff")
+        )
 
         fenced = re.fullmatch(
             r"```(?:json|JSON)?\s*(.*?)\s*```",
             clean,
             flags=re.DOTALL,
         )
+
         if fenced:
             clean = fenced.group(1).strip()
 
         if clean.startswith("{") or clean.startswith("["):
             return clean
 
-        candidates: list[tuple[int, str]] = []
+        candidates: list[
+            tuple[int, str]
+        ] = []
 
         first_object = clean.find("{")
         last_object = clean.rfind("}")
-        if first_object >= 0 and last_object > first_object:
-            candidates.append((first_object, clean[first_object : last_object + 1]))
+
+        if (
+            first_object >= 0
+            and last_object > first_object
+        ):
+            candidates.append(
+                (
+                    first_object,
+                    clean[
+                        first_object:
+                        last_object + 1
+                    ],
+                )
+            )
 
         first_array = clean.find("[")
         last_array = clean.rfind("]")
-        if first_array >= 0 and last_array > first_array:
-            candidates.append((first_array, clean[first_array : last_array + 1]))
+
+        if (
+            first_array >= 0
+            and last_array > first_array
+        ):
+            candidates.append(
+                (
+                    first_array,
+                    clean[
+                        first_array:
+                        last_array + 1
+                    ],
+                )
+            )
 
         if candidates:
-            candidates.sort(key=lambda item: item[0])
+            candidates.sort(
+                key=lambda item: item[0]
+            )
+
             return candidates[0][1]
 
         return clean
@@ -666,32 +1024,75 @@ class GodBaseAgent(AgentCapabilityProfile):
         *,
         response_schema: Optional[Type[T]] = None,
     ) -> tuple[Any, Optional[str]]:
-        bounded = _bounded_text(raw_text, self.config.max_output_chars)
-        cleaned = self._sanitize_json(bounded)
+        clean_raw = str(
+            raw_text or ""
+        ).strip()
+
+        # Never truncate a JSON document before parsing it.
+        # Truncation can convert valid structured output into malformed JSON.
+        if len(clean_raw) > self.config.max_output_chars:
+            raise ValueError(
+                "model output exceeds configured maximum size "
+                f"of {self.config.max_output_chars} characters"
+            )
+
+        cleaned = self._sanitize_json(
+            clean_raw
+        )
 
         try:
-            parsed = json.loads(cleaned)
+            parsed = json.loads(
+                cleaned
+            )
         except json.JSONDecodeError as exc:
             raise ValueError(
-                f"invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}"
+                "invalid JSON at line "
+                f"{exc.lineno}, column "
+                f"{exc.colno}: {exc.msg}"
             ) from exc
 
         if response_schema is not None:
-            model_validate = getattr(response_schema, "model_validate", None)
+            model_validate = getattr(
+                response_schema,
+                "model_validate",
+                None,
+            )
+
             if callable(model_validate):
-                parsed = model_validate(parsed)
+                parsed = model_validate(
+                    parsed
+                )
             else:
-                parse_obj = getattr(response_schema, "parse_obj", None)
+                parse_obj = getattr(
+                    response_schema,
+                    "parse_obj",
+                    None,
+                )
+
                 if callable(parse_obj):
-                    parsed = parse_obj(parsed)
-                elif isinstance(response_schema, type) and not isinstance(
-                    parsed, response_schema
+                    parsed = parse_obj(
+                        parsed
+                    )
+                elif (
+                    isinstance(response_schema, type)
+                    and not isinstance(
+                        parsed,
+                        response_schema,
+                    )
                 ):
-                    parsed = response_schema(parsed)
+                    parsed = response_schema(
+                        parsed
+                    )
 
         status = None
-        if isinstance(parsed, Mapping) and parsed.get("status") is not None:
-            status = str(parsed["status"]).upper()
+
+        if (
+            isinstance(parsed, Mapping)
+            and parsed.get("status") is not None
+        ):
+            status = str(
+                parsed["status"]
+            ).upper()
 
         return parsed, status
 
@@ -704,10 +1105,17 @@ class GodBaseAgent(AgentCapabilityProfile):
         request: AgentRequest,
     ) -> tuple[str, Optional[str], dict[str, Any]]:
         gateway = self.get_gateway()
-        generate = getattr(gateway, "generate", None)
+
+        generate = getattr(
+            gateway,
+            "generate",
+            None,
+        )
+
         if generate is None:
             raise RuntimeError(
-                f"Gateway handle for {self.role_name} has no generate() method"
+                f"Gateway handle for {self.role_name} "
+                "has no generate() method"
             )
 
         kwargs = {
@@ -720,47 +1128,44 @@ class GodBaseAgent(AgentCapabilityProfile):
             "timeout_seconds": request.timeout_seconds,
         }
 
-        async def _async_call() -> Any:
-            try:
-                return await generate(request.directive, **kwargs)
-            except TypeError as exc:
-                # Signature compatibility only; this is not a provider retry.
-                logger.debug(
-                    "Gateway optional-argument compatibility fallback for %s: %s",
-                    self.role_name,
-                    exc,
-                )
-                compact_kwargs = {
-                    "system_prompt": request.system_prompt,
-                    "temperature": request.temperature,
-                    "max_tokens": request.max_tokens,
-                }
-                return await generate(request.directive, **compact_kwargs)
+        supported_kwargs = (
+            self._filter_supported_kwargs(
+                generate,
+                kwargs,
+            )
+        )
 
-        if inspect.iscoroutinefunction(generate):
+        async def _call_result() -> Any:
+            result = generate(
+                request.directive,
+                **supported_kwargs,
+            )
+
+            if inspect.isawaitable(result):
+                return await result
+
+            return result
+
+        if inspect.iscoroutinefunction(
+            generate
+        ):
             response = await asyncio.wait_for(
-                _async_call(),
+                _call_result(),
                 timeout=request.timeout_seconds,
             )
         else:
             def _sync_call() -> Any:
-                try:
-                    return generate(request.directive, **kwargs)
-                except TypeError as exc:
-                    logger.debug(
-                        "Gateway optional-argument compatibility fallback for %s: %s",
-                        self.role_name,
-                        exc,
-                    )
-                    compact_kwargs = {
-                        "system_prompt": request.system_prompt,
-                        "temperature": request.temperature,
-                        "max_tokens": request.max_tokens,
-                    }
-                    return generate(request.directive, **compact_kwargs)
+                result = generate(
+                    request.directive,
+                    **supported_kwargs,
+                )
+
+                return result
 
             response = await asyncio.wait_for(
-                asyncio.to_thread(_sync_call),
+                asyncio.to_thread(
+                    _sync_call
+                ),
                 timeout=request.timeout_seconds,
             )
 
@@ -770,11 +1175,22 @@ class GodBaseAgent(AgentCapabilityProfile):
                 timeout=request.timeout_seconds,
             )
 
-        text, provider, response_metadata = _extract_response_text(response)
-        if not text.strip():
-            raise ValueError("gateway returned an empty model response")
+        text, provider, response_metadata = (
+            _extract_response_text(
+                response
+            )
+        )
 
-        return text, provider, response_metadata
+        if not text.strip():
+            raise ValueError(
+                "gateway returned an empty model response"
+            )
+
+        return (
+            text,
+            provider,
+            response_metadata,
+        )
 
     # ------------------------------------------------------------------
     # Main result API
@@ -803,35 +1219,67 @@ class GodBaseAgent(AgentCapabilityProfile):
         )
 
         started = time.perf_counter()
-        context_hash = _sha256_text(_canonical_json(request.context))
-        self._invocations += 1
+
+        context_hash = _sha256_text(
+            _canonical_json(
+                request.context
+            )
+        )
+
+        with self._stats_lock:
+            self._invocations += 1
 
         async with self._concurrency:
             try:
-                raw_response, provider, response_metadata = await self._invoke_gateway(
-                    request
+                raw_response, provider, response_metadata = (
+                    await self._invoke_gateway(
+                        request
+                    )
                 )
-                parsed, status = self.parse_model_output(
-                    raw_response,
-                    response_schema=response_schema,
+
+                parsed, status = (
+                    self.parse_model_output(
+                        raw_response,
+                        response_schema=response_schema,
+                    )
                 )
 
                 if status == "FAILED":
-                    execution_status = AgentExecutionStatus.FAILED
-                    self._failures += 1
+                    execution_status = (
+                        AgentExecutionStatus.FAILED
+                    )
+
+                    with self._stats_lock:
+                        self._failures += 1
+
                     error = (
                         str(parsed.get("error"))
-                        if isinstance(parsed, Mapping) and parsed.get("error")
+                        if (
+                            isinstance(parsed, Mapping)
+                            and parsed.get("error")
+                        )
                         else "Specialist agent returned FAILED"
                     )
                 else:
-                    execution_status = AgentExecutionStatus.SUCCESS
-                    self._successes += 1
+                    execution_status = (
+                        AgentExecutionStatus.SUCCESS
+                    )
+
+                    with self._stats_lock:
+                        self._successes += 1
+
                     error = None
 
                 data = _json_safe(parsed)
-                output_hash = _sha256_text(_canonical_json(data))
-                duration_ms = (time.perf_counter() - started) * 1000.0
+
+                output_hash = _sha256_text(
+                    _canonical_json(data)
+                )
+
+                duration_ms = (
+                    time.perf_counter()
+                    - started
+                ) * 1000.0
 
                 record = AgentExecutionRecord(
                     request_id=request.request_id,
@@ -845,7 +1293,10 @@ class GodBaseAgent(AgentCapabilityProfile):
                     provider=provider,
                     error=error,
                 )
-                self._record_history(record)
+
+                self._record_history(
+                    record
+                )
 
                 return AgentResult(
                     status=execution_status,
@@ -864,8 +1315,14 @@ class GodBaseAgent(AgentCapabilityProfile):
                 )
 
             except asyncio.CancelledError:
-                duration_ms = (time.perf_counter() - started) * 1000.0
-                self._failures += 1
+                duration_ms = (
+                    time.perf_counter()
+                    - started
+                ) * 1000.0
+
+                with self._stats_lock:
+                    self._failures += 1
+
                 self._record_history(
                     AgentExecutionRecord(
                         request_id=request.request_id,
@@ -878,12 +1335,19 @@ class GodBaseAgent(AgentCapabilityProfile):
                         error="cancelled",
                     )
                 )
+
                 raise
 
             except asyncio.TimeoutError:
-                duration_ms = (time.perf_counter() - started) * 1000.0
-                self._timeouts += 1
-                self._failures += 1
+                duration_ms = (
+                    time.perf_counter()
+                    - started
+                ) * 1000.0
+
+                with self._stats_lock:
+                    self._timeouts += 1
+                    self._failures += 1
+
                 self._record_history(
                     AgentExecutionRecord(
                         request_id=request.request_id,
@@ -896,6 +1360,7 @@ class GodBaseAgent(AgentCapabilityProfile):
                         error="agent execution timed out",
                     )
                 )
+
                 return AgentResult(
                     status=AgentExecutionStatus.TIMEOUT,
                     role=self.role_name,
@@ -905,9 +1370,15 @@ class GodBaseAgent(AgentCapabilityProfile):
                 )
 
             except ValueError as exc:
-                duration_ms = (time.perf_counter() - started) * 1000.0
-                self._invalid_outputs += 1
-                self._failures += 1
+                duration_ms = (
+                    time.perf_counter()
+                    - started
+                ) * 1000.0
+
+                with self._stats_lock:
+                    self._invalid_outputs += 1
+                    self._failures += 1
+
                 self._record_history(
                     AgentExecutionRecord(
                         request_id=request.request_id,
@@ -920,6 +1391,7 @@ class GodBaseAgent(AgentCapabilityProfile):
                         error=str(exc),
                     )
                 )
+
                 return AgentResult(
                     status=AgentExecutionStatus.INVALID_OUTPUT,
                     role=self.role_name,
@@ -929,13 +1401,20 @@ class GodBaseAgent(AgentCapabilityProfile):
                 )
 
             except Exception as exc:
-                duration_ms = (time.perf_counter() - started) * 1000.0
-                self._failures += 1
+                duration_ms = (
+                    time.perf_counter()
+                    - started
+                ) * 1000.0
+
+                with self._stats_lock:
+                    self._failures += 1
+
                 logger.exception(
                     "[AGENT ERROR] role=%s request=%s",
                     self.role_name,
                     request.request_id,
                 )
+
                 self._record_history(
                     AgentExecutionRecord(
                         request_id=request.request_id,
@@ -948,6 +1427,7 @@ class GodBaseAgent(AgentCapabilityProfile):
                         error=f"{type(exc).__name__}: {exc}",
                     )
                 )
+
                 return AgentResult(
                     status=AgentExecutionStatus.FAILED,
                     role=self.role_name,
@@ -961,7 +1441,7 @@ class GodBaseAgent(AgentCapabilityProfile):
         task_directive: str,
         context: Optional[Mapping[str, Any]] = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Backward-compatible dictionary API."""
         result = await self.think_and_execute_result(
             task_directive,
@@ -969,25 +1449,46 @@ class GodBaseAgent(AgentCapabilityProfile):
             **kwargs,
         )
 
-        if isinstance(result.data, Mapping):
+        if isinstance(
+            result.data,
+            Mapping,
+        ):
             payload = dict(result.data)
         else:
-            payload = {"data": result.data}
+            payload = {
+                "data": result.data
+            }
 
-        payload.setdefault("status", "SUCCESS" if result.ok else "FAILED")
+        payload.setdefault(
+            "status",
+            "SUCCESS"
+            if result.ok
+            else "FAILED",
+        )
+
+        runtime_payload = {
+            "request_id": result.request_id,
+            "role": result.role,
+            "provider": result.provider,
+            "status": result.status.value,
+            "duration_ms": round(
+                result.duration_ms,
+                3,
+            ),
+            **result.metadata,
+        }
+
         payload.setdefault(
             "_agent_runtime",
-            {
-                "request_id": result.request_id,
-                "role": result.role,
-                "provider": result.provider,
-                "status": result.status.value,
-                "duration_ms": round(result.duration_ms, 3),
-                **result.metadata,
-            },
+            runtime_payload,
         )
+
         if result.error:
-            payload.setdefault("error", result.error)
+            payload.setdefault(
+                "error",
+                result.error,
+            )
+
         return payload
 
     # ------------------------------------------------------------------
@@ -998,29 +1499,51 @@ class GodBaseAgent(AgentCapabilityProfile):
         self,
         directives: Sequence[str],
         *,
-        contexts: Optional[Sequence[Optional[Mapping[str, Any]]]] = None,
+        contexts: Optional[
+            Sequence[
+                Optional[
+                    Mapping[str, Any]
+                ]
+            ]
+        ] = None,
         fail_fast: bool = False,
         **kwargs: Any,
     ) -> list[AgentResult]:
-        if len(directives) > self.config.max_parallel_batch:
+        if (
+            len(directives)
+            > self.config.max_parallel_batch
+        ):
             raise ValueError(
-                f"parallel batch exceeds configured limit "
+                "parallel batch exceeds configured limit "
                 f"{self.config.max_parallel_batch}"
             )
 
-        if contexts is not None and len(contexts) != len(directives):
-            raise ValueError("contexts length must equal directives length")
+        if (
+            contexts is not None
+            and len(contexts)
+            != len(directives)
+        ):
+            raise ValueError(
+                "contexts length must equal directives length"
+            )
 
         tasks = [
             asyncio.create_task(
                 self.think_and_execute_result(
                     directive,
-                    contexts[index] if contexts is not None else None,
+                    (
+                        contexts[index]
+                        if contexts is not None
+                        else None
+                    ),
                     **kwargs,
                 ),
-                name=f"riot-agent-{self.role_name}-{index}",
+                name=(
+                    f"riot-agent-{self.role_name}-{index}"
+                ),
             )
-            for index, directive in enumerate(directives)
+            for index, directive
+            in enumerate(directives)
         ]
 
         if not tasks:
@@ -1028,20 +1551,43 @@ class GodBaseAgent(AgentCapabilityProfile):
 
         if fail_fast:
             try:
-                return list(await asyncio.gather(*tasks))
+                return list(
+                    await asyncio.gather(
+                        *tasks
+                    )
+                )
             except BaseException:
                 for task in tasks:
                     if not task.done():
                         task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+
+                await asyncio.gather(
+                    *tasks,
+                    return_exceptions=True,
+                )
+
                 raise
 
-        completed = await asyncio.gather(*tasks, return_exceptions=True)
+        completed = await asyncio.gather(
+            *tasks,
+            return_exceptions=True,
+        )
+
         results: list[AgentResult] = []
-        for index, item in enumerate(completed):
-            if isinstance(item, AgentResult):
+
+        for index, item in enumerate(
+            completed
+        ):
+            if isinstance(
+                item,
+                AgentResult,
+            ):
                 results.append(item)
-            elif isinstance(item, asyncio.CancelledError):
+
+            elif isinstance(
+                item,
+                asyncio.CancelledError,
+            ):
                 results.append(
                     AgentResult(
                         status=AgentExecutionStatus.CANCELLED,
@@ -1050,51 +1596,93 @@ class GodBaseAgent(AgentCapabilityProfile):
                         error="cancelled",
                     )
                 )
+
             else:
                 results.append(
                     AgentResult(
                         status=AgentExecutionStatus.FAILED,
                         role=self.role_name,
                         request_id=f"batch_{index}",
-                        error=f"{type(item).__name__}: {item}",
+                        error=(
+                            f"{type(item).__name__}: {item}"
+                        ),
                     )
                 )
+
         return results
 
     # ------------------------------------------------------------------
     # Telemetry
     # ------------------------------------------------------------------
 
-    def _record_history(self, record: AgentExecutionRecord) -> None:
+    def _record_history(
+        self,
+        record: AgentExecutionRecord,
+    ) -> None:
         with self._history_lock:
-            self._history.append(record)
+            self._history.append(
+                record
+            )
 
-    def history(self) -> list[dict[str, Any]]:
+    def history(
+        self,
+    ) -> list[dict[str, Any]]:
         with self._history_lock:
-            return [record.to_dict() for record in self._history]
+            return [
+                record.to_dict()
+                for record in self._history
+            ]
 
-    def stats(self) -> dict[str, Any]:
+    def stats(
+        self,
+    ) -> dict[str, Any]:
         with self._history_lock:
-            history_entries = len(self._history)
+            history_entries = len(
+                self._history
+            )
+
+        with self._stats_lock:
+            invocations = self._invocations
+            successes = self._successes
+            failures = self._failures
+            timeouts = self._timeouts
+            invalid_outputs = (
+                self._invalid_outputs
+            )
 
         return {
             "role": self.role_name,
             "service_type": self.service_type,
-            "required_capabilities": sorted(self.required_capabilities),
-            "invocations": self._invocations,
-            "successes": self._successes,
-            "failures": self._failures,
-            "timeouts": self._timeouts,
-            "invalid_outputs": self._invalid_outputs,
-            "success_rate": round(
-                self._successes / self._invocations, 4
-            ) if self._invocations else 0.0,
+            "required_capabilities": sorted(
+                self.required_capabilities
+            ),
+            "invocations": invocations,
+            "successes": successes,
+            "failures": failures,
+            "timeouts": timeouts,
+            "invalid_outputs": invalid_outputs,
+            "success_rate": (
+                round(
+                    successes / invocations,
+                    4,
+                )
+                if invocations
+                else 0.0
+            ),
             "history_entries": history_entries,
-            "concurrency_limit": self.config.max_concurrency,
-            "parallel_batch_limit": self.config.max_parallel_batch,
+            "concurrency_limit": (
+                self.config.max_concurrency
+            ),
+            "parallel_batch_limit": (
+                self.config.max_parallel_batch
+            ),
         }
 
-    async def perform_role(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    async def perform_role(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         """
         Explicit failure for the abstract base compatibility surface.
 
@@ -1103,7 +1691,8 @@ class GodBaseAgent(AgentCapabilityProfile):
         return {
             "status": "FAILED",
             "error": (
-                f"{self.role_name} has no specialist perform_role() implementation."
+                f"{self.role_name} has no specialist "
+                "perform_role() implementation."
             ),
         }
 
