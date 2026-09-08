@@ -27,8 +27,6 @@ import json
 import logging
 import math
 import os
-import random
-import sys
 import threading
 import time
 import uuid
@@ -39,22 +37,17 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 import aiohttp
 from fastapi import APIRouter
 
-# ---------------------------------------------------------------------------
-# Compatibility bootstrap.
-# provider_sdk.py currently imports its sibling modules as top-level modules.
-# Map those names to the package modules before importing provider_sdk.
-# ---------------------------------------------------------------------------
-from god_brain import connection_pool as _connection_pool_module
-from god_brain import circuit_breaker as _circuit_breaker_module
+from god_brain.connection_pool import (
+    HTTP_CLIENT,
+    MODEL_CACHE,
+)
 
-sys.modules.setdefault("connection_pool", _connection_pool_module)
-sys.modules.setdefault("circuit_breaker", _circuit_breaker_module)
-
-from god_brain.connection_pool import HTTP_CLIENT, MODEL_CACHE
 from god_brain.circuit_breaker import (
     CIRCUIT_REGISTRY,
     PROVIDER_EXECUTOR,
+    CircuitOpenError,
 )
+
 from god_brain.provider_sdk import (
     AuthenticationConfig,
     AuthenticationType,
@@ -74,6 +67,7 @@ from god_brain.provider_sdk import (
 # ============================================================================
 
 logger = logging.getLogger("Riot.DynamicGateway")
+
 if not logger.handlers:
     handler = logging.StreamHandler()
     handler.setFormatter(
@@ -84,7 +78,10 @@ if not logger.handlers:
     logger.addHandler(handler)
 
 logger.setLevel(
-    os.getenv("RIOT_GATEWAY_LOG_LEVEL", "INFO").upper()
+    os.getenv(
+        "RIOT_GATEWAY_LOG_LEVEL",
+        "INFO",
+    ).upper()
 )
 
 DEFAULT_TIMEOUT_SECONDS = 60
@@ -98,7 +95,9 @@ RETRYABLE_HTTP_CODES = frozenset(
     {408, 425, 429, 500, 502, 503, 504}
 )
 
-AUTH_FAILURE_CODES = frozenset({401, 403})
+AUTH_FAILURE_CODES = frozenset(
+    {401, 403}
+)
 
 
 # ============================================================================
@@ -159,13 +158,17 @@ class GatewayRequest:
     max_tokens: Optional[int] = None
     service: str = "default"
     required_capabilities: frozenset[str] = frozenset()
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(
+        default_factory=dict
+    )
     timeout_seconds: Optional[float] = None
     max_failovers: int = DEFAULT_MAX_FAILOVERS
     routing_mode: RoutingMode = RoutingMode.BALANCED
     preferred_provider: Optional[str] = None
     excluded_providers: frozenset[str] = frozenset()
-    request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    request_id: str = field(
+        default_factory=lambda: uuid.uuid4().hex
+    )
 
 
 @dataclass(slots=True)
@@ -179,7 +182,9 @@ class GatewayResponse:
     attempts: int
     status_code: Optional[int] = None
     raw_response: Any = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(slots=True)
@@ -188,16 +193,22 @@ class ProviderRuntime:
     successful_requests: int = 0
     failed_requests: int = 0
     in_flight: int = 0
+
     last_latency_ms: float = 0.0
     ema_latency_ms: float = 0.0
+
     consecutive_failures: int = 0
     consecutive_successes: int = 0
+
     last_success_at: float = 0.0
     last_failure_at: float = 0.0
     last_error: Optional[str] = None
+
     cooldown_until: float = 0.0
+
     rate_remaining: Optional[int] = None
     rate_reset_at: float = 0.0
+
     bytes_sent: int = 0
     bytes_received: int = 0
 
@@ -209,44 +220,78 @@ class ProviderRuntime:
     last_selected_at: float = 0.0
 
     semaphore: Optional[asyncio.Semaphore] = None
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock
+    )
 
 
 # ============================================================================
 # GENERIC HELPERS
 # ============================================================================
 
-def _safe_float(value: Any, default: float) -> float:
+def _safe_float(
+    value: Any,
+    default: float,
+) -> float:
     try:
         value = float(value)
-        return value if math.isfinite(value) else default
+        return (
+            value
+            if math.isfinite(value)
+            else default
+        )
     except (TypeError, ValueError):
         return default
 
 
-def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+def _safe_int(
+    value: Any,
+    default: Optional[int] = None,
+) -> Optional[int]:
     try:
         return int(value)
     except (TypeError, ValueError):
         return default
 
 
-def _fingerprint(value: Any) -> str:
+def _fingerprint(
+    value: Any,
+) -> str:
     if value is None:
         return ""
-    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+
+    return hashlib.sha256(
+        str(value).encode("utf-8")
+    ).hexdigest()[:16]
 
 
-def _public_endpoint(url: str) -> str:
+def _public_endpoint(
+    url: str,
+) -> str:
     if not url:
         return ""
-    return str(url).split("?", 1)[0].split("#", 1)[0]
+
+    return (
+        str(url)
+        .split("?", 1)[0]
+        .split("#", 1)[0]
+    )
 
 
-def _path_parts(path: Sequence[str] | str) -> List[str]:
+def _path_parts(
+    path: Sequence[str] | str,
+) -> List[str]:
     if isinstance(path, str):
-        return [part for part in path.strip(".").split(".") if part]
-    return [str(part) for part in path]
+        return [
+            part
+            for part in path.strip(".").split(".")
+            if part
+        ]
+
+    return [
+        str(part)
+        for part in path
+    ]
 
 
 def _extract_path(
@@ -255,18 +300,29 @@ def _extract_path(
     default: Any = None,
 ) -> Any:
     current = payload
+
     for part in _path_parts(path):
         if isinstance(current, Mapping):
             if part not in current:
                 return default
+
             current = current[part]
+
         elif isinstance(current, list):
             index = _safe_int(part)
-            if index is None or index < 0 or index >= len(current):
+
+            if (
+                index is None
+                or index < 0
+                or index >= len(current)
+            ):
                 return default
+
             current = current[index]
+
         else:
             return default
+
     return current
 
 
@@ -276,83 +332,159 @@ def _assign_path(
     value: Any,
 ) -> None:
     parts = _path_parts(path)
+
     if not parts:
         return
+
     current = target
+
     for part in parts[:-1]:
         child = current.get(part)
+
         if not isinstance(child, dict):
             child = {}
             current[part] = child
+
         current = child
+
     current[parts[-1]] = value
 
 
-def _normalize_text(value: Any) -> str:
+def _normalize_text(
+    value: Any,
+) -> str:
     if value is None:
         return ""
+
     if isinstance(value, str):
         return value.strip()
 
     if isinstance(value, list):
         parts: List[str] = []
+
         for item in value:
             if isinstance(item, str):
                 parts.append(item)
+
             elif isinstance(item, Mapping):
-                for key in ("text", "content", "value"):
+                for key in (
+                    "text",
+                    "content",
+                    "value",
+                ):
                     if key in item:
-                        text = _normalize_text(item[key])
+                        text = _normalize_text(
+                            item[key]
+                        )
+
                         if text:
                             parts.append(text)
+
                         break
+
         return "".join(parts).strip()
 
     if isinstance(value, Mapping):
-        for key in ("text", "content", "output", "response", "value"):
+        for key in (
+            "text",
+            "content",
+            "output",
+            "response",
+            "value",
+        ):
             if key in value:
-                text = _normalize_text(value[key])
+                text = _normalize_text(
+                    value[key]
+                )
+
                 if text:
                     return text
 
     return str(value).strip()
 
 
-def _estimate_tokens(text: Any) -> int:
-    """Conservative local token estimate used only for telemetry/cost hints."""
+def _estimate_tokens(
+    text: Any,
+) -> int:
+    """
+    Conservative local token estimate used only
+    for telemetry/cost hints.
+    """
     if text is None:
         return 0
+
     raw = str(text)
+
     if not raw:
         return 0
-    return max(1, math.ceil(len(raw) / 4))
+
+    return max(
+        1,
+        math.ceil(len(raw) / 4),
+    )
 
 
-def _resolve_template(value: Any, context: Mapping[str, Any]) -> Any:
+def _resolve_template(
+    value: Any,
+    context: Mapping[str, Any],
+) -> Any:
     if isinstance(value, Mapping):
         return {
-            str(key): _resolve_template(item, context)
+            str(key): _resolve_template(
+                item,
+                context,
+            )
             for key, item in value.items()
         }
+
     if isinstance(value, list):
-        return [_resolve_template(item, context) for item in value]
+        return [
+            _resolve_template(
+                item,
+                context,
+            )
+            for item in value
+        ]
+
     if not isinstance(value, str):
         return value
 
-    if not value.startswith("${") or not value.endswith("}"):
+    if (
+        not value.startswith("${")
+        or not value.endswith("}")
+    ):
         return value
 
     expression = value[2:-1].strip()
-    result = _extract_path(context, expression)
-    return result if result is not None else value
+
+    result = _extract_path(
+        context,
+        expression,
+    )
+
+    return (
+        result
+        if result is not None
+        else value
+    )
 
 
-def _enum_value(value: Any, enum_type: type[Enum], default: Any) -> Any:
+def _enum_value(
+    value: Any,
+    enum_type: type[Enum],
+    default: Any,
+) -> Any:
     if isinstance(value, enum_type):
         return value
+
     try:
-        return enum_type(str(value).lower())
-    except (TypeError, ValueError):
+        return enum_type(
+            str(value).lower()
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
         return default
 
 
@@ -363,12 +495,19 @@ def _enum_value(value: Any, enum_type: type[Enum], default: Any) -> Any:
 def _auth_config(
     value: Any,
 ) -> AuthenticationConfig:
-    if isinstance(value, AuthenticationConfig):
+    if isinstance(
+        value,
+        AuthenticationConfig,
+    ):
         return value
 
     data = dict(value or {})
+
     auth_type = _enum_value(
-        data.get("type", AuthenticationType.NONE.value),
+        data.get(
+            "type",
+            AuthenticationType.NONE.value,
+        ),
         AuthenticationType,
         AuthenticationType.NONE,
     )
@@ -376,62 +515,133 @@ def _auth_config(
     return AuthenticationConfig(
         type=auth_type,
         token=data.get("token"),
-        header_name=str(data.get("header_name", "Authorization")),
-        query_name=str(data.get("query_name", "key")),
-        prefix=str(data.get("prefix", "Bearer")),
+        header_name=str(
+            data.get(
+                "header_name",
+                "Authorization",
+            )
+        ),
+        query_name=str(
+            data.get(
+                "query_name",
+                "key",
+            )
+        ),
+        prefix=str(
+            data.get(
+                "prefix",
+                "Bearer",
+            )
+        ),
         custom_headers={
             str(k): str(v)
-            for k, v in dict(data.get("custom_headers", {})).items()
+            for k, v in dict(
+                data.get(
+                    "custom_headers",
+                    {},
+                )
+            ).items()
         },
     )
 
 
-def _payload_config(value: Any) -> PayloadMapping:
-    if isinstance(value, PayloadMapping):
+def _payload_config(
+    value: Any,
+) -> PayloadMapping:
+    if isinstance(
+        value,
+        PayloadMapping,
+    ):
         return value
 
     data = dict(value or {})
+
     return PayloadMapping(
-        prompt_field=str(data.get("prompt_field", "prompt")),
+        prompt_field=str(
+            data.get(
+                "prompt_field",
+                "prompt",
+            )
+        ),
         system_field=(
-            str(data["system_field"])
-            if data.get("system_field") is not None
+            str(
+                data["system_field"]
+            )
+            if data.get(
+                "system_field"
+            ) is not None
             else None
         ),
         temperature_field=(
-            str(data["temperature_field"])
-            if data.get("temperature_field") is not None
+            str(
+                data["temperature_field"]
+            )
+            if data.get(
+                "temperature_field"
+            ) is not None
             else None
         ),
         max_tokens_field=(
-            str(data["max_tokens_field"])
-            if data.get("max_tokens_field") is not None
+            str(
+                data["max_tokens_field"]
+            )
+            if data.get(
+                "max_tokens_field"
+            ) is not None
             else None
         ),
         metadata_field=(
-            str(data["metadata_field"])
-            if data.get("metadata_field") is not None
+            str(
+                data["metadata_field"]
+            )
+            if data.get(
+                "metadata_field"
+            ) is not None
             else None
         ),
-        fixed_fields=dict(data.get("fixed_fields", {})),
+        fixed_fields=dict(
+            data.get(
+                "fixed_fields",
+                {},
+            )
+        ),
     )
 
 
-def _response_config(value: Any) -> ResponseMapping:
-    if isinstance(value, ResponseMapping):
+def _response_config(
+    value: Any,
+) -> ResponseMapping:
+    if isinstance(
+        value,
+        ResponseMapping,
+    ):
         return value
 
     data = dict(value or {})
-    path = data.get("output_path", ("output",))
+
+    path = data.get(
+        "output_path",
+        ("output",),
+    )
+
     if isinstance(path, str):
-        path = tuple(_path_parts(path))
+        path = tuple(
+            _path_parts(path)
+        )
     else:
-        path = tuple(str(item) for item in path)
+        path = tuple(
+            str(item)
+            for item in path
+        )
 
-    return ResponseMapping(output_path=path)
+    return ResponseMapping(
+        output_path=path
+    )
 
 
-def _protocol(value: Any) -> ProviderProtocol:
+def _protocol(
+    value: Any,
+) -> ProviderProtocol:
     return _enum_value(
         value,
         ProviderProtocol,
@@ -442,32 +652,53 @@ def _protocol(value: Any) -> ProviderProtocol:
 def _configuration_from_mapping(
     value: Mapping[str, Any],
 ) -> ProviderConfiguration:
-    name = str(value.get("name", "")).strip()
-    endpoint = str(value.get("endpoint", "")).strip()
+    name = str(
+        value.get(
+            "name",
+            "",
+        )
+    ).strip()
+
+    endpoint = str(
+        value.get(
+            "endpoint",
+            "",
+        )
+    ).strip()
 
     if not name:
         raise DynamicConfigurationError(
             "Provider configuration requires a non-empty name."
         )
+
     if not endpoint:
         raise DynamicConfigurationError(
-            "Provider configuration requires a non-empty endpoint.",
+            (
+                "Provider configuration requires "
+                "a non-empty endpoint."
+            ),
             provider=name,
         )
 
     timeout = max(
         1,
         _safe_int(
-            value.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+            value.get(
+                "timeout_seconds",
+                DEFAULT_TIMEOUT_SECONDS,
+            ),
             DEFAULT_TIMEOUT_SECONDS,
         )
         or DEFAULT_TIMEOUT_SECONDS,
     )
 
-    metadata = dict(value.get("metadata", {}))
+    metadata = dict(
+        value.get(
+            "metadata",
+            {},
+        )
+    )
 
-    # Keep operational metadata in one canonical object. This avoids creating
-    # a second provider schema inside the gateway.
     for field_name in (
         "services",
         "capabilities",
@@ -487,28 +718,55 @@ def _configuration_from_mapping(
         "payload_template",
         "idempotency_header",
     ):
-        if field_name in value and field_name not in metadata:
-            metadata[field_name] = value[field_name]
+        if (
+            field_name in value
+            and field_name not in metadata
+        ):
+            metadata[field_name] = value[
+                field_name
+            ]
 
     return ProviderConfiguration(
         name=name,
         endpoint=endpoint,
-        protocol=_protocol(value.get("protocol")),
-        enabled=bool(value.get("enabled", True)),
+        protocol=_protocol(
+            value.get("protocol")
+        ),
+        enabled=bool(
+            value.get(
+                "enabled",
+                True,
+            )
+        ),
         timeout_seconds=timeout,
         authentication=_auth_config(
-            value.get("authentication", {})
+            value.get(
+                "authentication",
+                {},
+            )
         ),
         payload=_payload_config(
-            value.get("payload", {})
+            value.get(
+                "payload",
+                {},
+            )
         ),
         response=_response_config(
-            value.get("response", {})
+            value.get(
+                "response",
+                {},
+            )
         ),
         default_headers={
             str(k): str(v)
             for k, v in dict(
-                value.get("default_headers", value.get("headers", {}))
+                value.get(
+                    "default_headers",
+                    value.get(
+                        "headers",
+                        {},
+                    ),
+                )
             ).items()
         },
         metadata=metadata,
@@ -519,62 +777,116 @@ def _configuration_from_mapping(
 # UNIVERSAL CONFIGURATION-DRIVEN ADAPTER
 # ============================================================================
 
-class DynamicProviderAdapter(ProviderAdapter):
+class DynamicProviderAdapter(
+    ProviderAdapter
+):
     """
-    Generic HTTP adapter used when no specialized adapter is registered.
+    Generic HTTP adapter used when no specialized
+    adapter is registered.
 
-    Provider-specific behavior comes entirely from ProviderConfiguration.
+    Provider-specific behavior comes entirely from
+    ProviderConfiguration.
     """
 
-    def build_headers(self) -> Dict[str, str]:
+    def build_headers(
+        self,
+    ) -> Dict[str, str]:
         configuration = self.configuration
+
         headers: Dict[str, str] = {
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
-        headers.update(configuration.default_headers)
+
+        headers.update(
+            configuration.default_headers
+        )
 
         auth = configuration.authentication
 
-        if auth.type == AuthenticationType.BEARER and auth.token:
-            headers[auth.header_name] = (
-                f"{auth.prefix} {auth.token}"
+        if (
+            auth.type
+            == AuthenticationType.BEARER
+            and auth.token
+        ):
+            headers[
+                auth.header_name
+            ] = (
+                f"{auth.prefix} "
+                f"{auth.token}"
             )
 
         elif (
-            auth.type == AuthenticationType.API_KEY_HEADER
+            auth.type
+            == AuthenticationType.API_KEY_HEADER
             and auth.token
         ):
-            headers[auth.header_name] = auth.token
+            headers[
+                auth.header_name
+            ] = auth.token
 
-        if auth.type == AuthenticationType.CUSTOM:
-            headers.update(auth.custom_headers)
+        if (
+            auth.type
+            == AuthenticationType.CUSTOM
+        ):
+            headers.update(
+                auth.custom_headers
+            )
 
-        metadata = configuration.metadata or {}
-        idempotency_header = metadata.get("idempotency_header")
+        metadata = (
+            configuration.metadata
+            or {}
+        )
+
+        idempotency_header = metadata.get(
+            "idempotency_header"
+        )
+
         if idempotency_header:
-            headers[str(idempotency_header)] = str(
-                self._current_request_id or ""
+            headers[
+                str(idempotency_header)
+            ] = str(
+                self._current_request_id
+                or ""
             )
 
         return headers
 
     @property
-    def _current_request_id(self) -> Optional[str]:
-        # Set transiently by invoke(). This keeps the SDK contract unchanged.
-        return getattr(self, "__request_id", None)
+    def _current_request_id(
+        self,
+    ) -> Optional[str]:
+        return getattr(
+            self,
+            "__request_id",
+            None,
+        )
 
     @_current_request_id.setter
-    def _current_request_id(self, value: str) -> None:
-        setattr(self, "__request_id", value)
+    def _current_request_id(
+        self,
+        value: str,
+    ) -> None:
+        setattr(
+            self,
+            "__request_id",
+            value,
+        )
 
-    def build_query(self) -> Dict[str, str]:
+    def build_query(
+        self,
+    ) -> Dict[str, str]:
         auth = self.configuration.authentication
+
         if (
-            auth.type == AuthenticationType.API_KEY_QUERY
+            auth.type
+            == AuthenticationType.API_KEY_QUERY
             and auth.token
         ):
-            return {auth.query_name: auth.token}
+            return {
+                auth.query_name: auth.token
+            }
+
         return {}
 
     def build_payload(
@@ -582,24 +894,50 @@ class DynamicProviderAdapter(ProviderAdapter):
         request: PromptRequest,
     ) -> Dict[str, Any]:
         configuration = self.configuration
-        metadata = configuration.metadata or {}
+
+        metadata = (
+            configuration.metadata
+            or {}
+        )
 
         context = {
             "prompt": request.prompt,
-            "system_prompt": request.system_prompt,
-            "model": request.metadata.get("model"),
-            "temperature": request.temperature,
-            "max_tokens": request.max_tokens,
+            "system_prompt": (
+                request.system_prompt
+            ),
+            "model": request.metadata.get(
+                "model"
+            ),
+            "temperature": (
+                request.temperature
+            ),
+            "max_tokens": (
+                request.max_tokens
+            ),
             "metadata": request.metadata,
         }
 
-        template = metadata.get("payload_template")
-        if isinstance(template, Mapping):
-            payload = _resolve_template(template, context)
-            if isinstance(payload, dict):
+        template = metadata.get(
+            "payload_template"
+        )
+
+        if isinstance(
+            template,
+            Mapping,
+        ):
+            payload = _resolve_template(
+                template,
+                context,
+            )
+
+            if isinstance(
+                payload,
+                dict,
+            ):
                 return payload
 
         mapping = configuration.payload
+
         payload: Dict[str, Any] = {}
 
         if mapping.fixed_fields:
@@ -618,7 +956,8 @@ class DynamicProviderAdapter(ProviderAdapter):
 
         if (
             mapping.system_field
-            and request.system_prompt is not None
+            and request.system_prompt
+            is not None
         ):
             _assign_path(
                 payload,
@@ -635,7 +974,8 @@ class DynamicProviderAdapter(ProviderAdapter):
 
         if (
             mapping.max_tokens_field
-            and request.max_tokens is not None
+            and request.max_tokens
+            is not None
         ):
             _assign_path(
                 payload,
@@ -643,19 +983,32 @@ class DynamicProviderAdapter(ProviderAdapter):
                 request.max_tokens,
             )
 
-        if mapping.metadata_field and request.metadata:
+        if (
+            mapping.metadata_field
+            and request.metadata
+        ):
             _assign_path(
                 payload,
                 mapping.metadata_field,
                 request.metadata,
             )
 
-        model_field = metadata.get("model_field")
-        if model_field and request.metadata.get("model") is not None:
+        model_field = metadata.get(
+            "model_field"
+        )
+
+        if (
+            model_field
+            and request.metadata.get(
+                "model"
+            ) is not None
+        ):
             _assign_path(
                 payload,
                 str(model_field),
-                request.metadata["model"],
+                request.metadata[
+                    "model"
+                ],
             )
 
         return payload
@@ -665,18 +1018,26 @@ class DynamicProviderAdapter(ProviderAdapter):
         request: PromptRequest,
     ) -> ProviderResponse:
         configuration = self.configuration
+
         self._current_request_id = str(
-            request.metadata.get("gateway_request_id", "")
+            request.metadata.get(
+                "gateway_request_id",
+                "",
+            )
         )
 
         method = str(
-            (configuration.metadata or {}).get(
+            (
+                configuration.metadata
+                or {}
+            ).get(
                 "http_method",
                 "POST",
             )
         ).upper()
 
         url = configuration.endpoint
+
         timeout_seconds = max(
             1,
             _safe_int(
@@ -689,11 +1050,15 @@ class DynamicProviderAdapter(ProviderAdapter):
             or configuration.timeout_seconds,
         )
 
-        payload = self.build_payload(request)
+        payload = self.build_payload(
+            request
+        )
+
         headers = self.build_headers()
         query = self.build_query()
 
         session = HTTP_CLIENT.session()
+
         started = time.perf_counter()
 
         kwargs: Dict[str, Any] = {
@@ -704,7 +1069,11 @@ class DynamicProviderAdapter(ProviderAdapter):
             ),
         }
 
-        if method not in {"GET", "HEAD", "DELETE"}:
+        if method not in {
+            "GET",
+            "HEAD",
+            "DELETE",
+        }:
             kwargs["json"] = payload
 
         request_bytes = len(
@@ -723,13 +1092,21 @@ class DynamicProviderAdapter(ProviderAdapter):
             ) as response:
 
                 body = await response.read()
+
                 elapsed_ms = (
-                    time.perf_counter() - started
+                    time.perf_counter()
+                    - started
                 ) * 1000.0
 
-                if len(body) > MAX_RESPONSE_BYTES:
+                if (
+                    len(body)
+                    > MAX_RESPONSE_BYTES
+                ):
                     raise ProviderExecutionError(
-                        "Provider response exceeded gateway safety limit.",
+                        (
+                            "Provider response "
+                            "exceeded gateway safety limit."
+                        ),
                         provider=configuration.name,
                         status=response.status,
                         retryable=False,
@@ -744,8 +1121,9 @@ class DynamicProviderAdapter(ProviderAdapter):
 
                     raise ProviderExecutionError(
                         (
-                            f"Dynamic provider request failed: "
-                            f"HTTP {response.status}: {detail}"
+                            "Dynamic provider request "
+                            f"failed: HTTP {response.status}: "
+                            f"{detail}"
                         ),
                         provider=configuration.name,
                         status=response.status,
@@ -777,19 +1155,26 @@ class DynamicProviderAdapter(ProviderAdapter):
                             retryable=False,
                             category="invalid_json",
                         ) from exc
+
                 else:
                     raw = body.decode(
                         "utf-8",
                         errors="replace",
                     )
 
-                response_mapping = configuration.response
+                response_mapping = (
+                    configuration.response
+                )
+
                 output = _extract_path(
                     raw,
                     response_mapping.output_path,
                 )
 
-                metadata = configuration.metadata or {}
+                metadata = (
+                    configuration.metadata
+                    or {}
+                )
 
                 if output is None:
                     for path in metadata.get(
@@ -800,17 +1185,29 @@ class DynamicProviderAdapter(ProviderAdapter):
                             raw,
                             path,
                         )
+
                         if output is not None:
                             break
 
-                output_text = _normalize_text(output)
+                output_text = _normalize_text(
+                    output
+                )
 
-                if not output_text and isinstance(raw, str):
+                if (
+                    not output_text
+                    and isinstance(
+                        raw,
+                        str,
+                    )
+                ):
                     output_text = raw.strip()
 
                 if not output_text:
                     raise ProviderExecutionError(
-                        "Provider returned no extractable output.",
+                        (
+                            "Provider returned no "
+                            "extractable output."
+                        ),
                         provider=configuration.name,
                         status=response.status,
                         retryable=False,
@@ -831,11 +1228,18 @@ class DynamicProviderAdapter(ProviderAdapter):
                 )
 
                 request_id = (
-                    response.headers.get("x-request-id")
-                    or response.headers.get("request-id")
+                    response.headers.get(
+                        "x-request-id"
+                    )
+                    or response.headers.get(
+                        "request-id"
+                    )
                     or (
-                        str(provider_request_id)
-                        if provider_request_id is not None
+                        str(
+                            provider_request_id
+                        )
+                        if provider_request_id
+                        is not None
                         else None
                     )
                 )
@@ -843,8 +1247,12 @@ class DynamicProviderAdapter(ProviderAdapter):
                 usage_path = metadata.get(
                     "response_usage_path"
                 )
+
                 usage = (
-                    _extract_path(raw, usage_path)
+                    _extract_path(
+                        raw,
+                        usage_path,
+                    )
                     if usage_path
                     else None
                 )
@@ -855,42 +1263,73 @@ class DynamicProviderAdapter(ProviderAdapter):
                 )
 
                 remaining_header = (
-                    rate_headers.get("remaining")
-                    if isinstance(rate_headers, Mapping)
-                    else None
-                )
-                reset_header = (
-                    rate_headers.get("reset")
-                    if isinstance(rate_headers, Mapping)
+                    rate_headers.get(
+                        "remaining"
+                    )
+                    if isinstance(
+                        rate_headers,
+                        Mapping,
+                    )
                     else None
                 )
 
-                response_metadata: Dict[str, Any] = {
+                reset_header = (
+                    rate_headers.get(
+                        "reset"
+                    )
+                    if isinstance(
+                        rate_headers,
+                        Mapping,
+                    )
+                    else None
+                )
+
+                response_metadata: Dict[
+                    str,
+                    Any,
+                ] = {
                     "status_code": response.status,
                     "request_id": request_id,
                     "latency_ms": elapsed_ms,
                     "request_bytes": request_bytes,
                     "response_bytes": len(body),
-                    "estimated_input_tokens": _estimate_tokens(request.prompt),
-                    "estimated_output_tokens": _estimate_tokens(output_text),
+                    "estimated_input_tokens": (
+                        _estimate_tokens(
+                            request.prompt
+                        )
+                    ),
+                    "estimated_output_tokens": (
+                        _estimate_tokens(
+                            output_text
+                        )
+                    ),
                 }
 
                 if usage is not None:
-                    response_metadata["usage"] = usage
+                    response_metadata[
+                        "usage"
+                    ] = usage
 
                 if remaining_header:
                     response_metadata[
                         "rate_remaining"
                     ] = _safe_int(
                         response.headers.get(
-                            str(remaining_header)
+                            str(
+                                remaining_header
+                            )
                         )
                     )
 
                 if reset_header:
-                    reset_value = response.headers.get(
-                        str(reset_header)
+                    reset_value = (
+                        response.headers.get(
+                            str(
+                                reset_header
+                            )
+                        )
                     )
+
                     response_metadata[
                         "rate_reset"
                     ] = _safe_float(
@@ -898,24 +1337,40 @@ class DynamicProviderAdapter(ProviderAdapter):
                         0.0,
                     )
 
-                # Optional generic telemetry header mapping. Providers may
-                # configure any header names; nothing is vendor-specific.
                 telemetry_headers = metadata.get(
                     "telemetry_headers",
                     {},
                 )
-                if isinstance(telemetry_headers, Mapping):
-                    for logical_name, header_name in telemetry_headers.items():
-                        value = response.headers.get(str(header_name))
+
+                if isinstance(
+                    telemetry_headers,
+                    Mapping,
+                ):
+                    for (
+                        logical_name,
+                        header_name,
+                    ) in telemetry_headers.items():
+
+                        value = response.headers.get(
+                            str(header_name)
+                        )
+
                         if value is not None:
-                            response_metadata[str(logical_name)] = value
+                            response_metadata[
+                                str(logical_name)
+                            ] = value
 
                 cost_per_1k = _safe_float(
-                    metadata.get("cost_per_1k_tokens"),
+                    metadata.get(
+                        "cost_per_1k_tokens"
+                    ),
                     0.0,
                 )
+
                 if cost_per_1k > 0:
-                    response_metadata["cost_per_1k_tokens"] = cost_per_1k
+                    response_metadata[
+                        "cost_per_1k_tokens"
+                    ] = cost_per_1k
 
                 return ProviderResponse(
                     success=True,
@@ -929,9 +1384,17 @@ class DynamicProviderAdapter(ProviderAdapter):
             raise ProviderExecutionError(
                 str(exc),
                 provider=configuration.name,
-                status=getattr(exc, "status", None),
+                status=getattr(
+                    exc,
+                    "status",
+                    None,
+                ),
                 retryable=(
-                    getattr(exc, "status", None)
+                    getattr(
+                        exc,
+                        "status",
+                        None,
+                    )
                     in RETRYABLE_HTTP_CODES
                 ),
                 category="transport",
@@ -965,18 +1428,51 @@ class GatewayRouter:
     """
     Canonical dynamic gateway.
 
-    Provider configuration is owned by PROVIDER_REGISTRY.
-    Gateway owns only runtime state and routing policy.
+    Riot owns one logical GatewayRouter instance.
+    All GatewayRouter() calls resolve to the same instance.
     """
 
-    _legacy_vault: Dict[str, List[Mapping[str, Any]]] = {}
+    _singleton_instance: Optional[
+        "GatewayRouter"
+    ] = None
+
+    _singleton_lock = threading.Lock()
+
+    _initialized = False
+
+    _legacy_vault: Dict[
+        str,
+        List[Mapping[str, Any]],
+    ] = {}
+
+    def __new__(
+        cls,
+        *args: Any,
+        **kwargs: Any,
+    ) -> "GatewayRouter":
+
+        if cls._singleton_instance is None:
+            with cls._singleton_lock:
+                if cls._singleton_instance is None:
+                    cls._singleton_instance = (
+                        super().__new__(cls)
+                    )
+
+        return cls._singleton_instance
 
     def __init__(
         self,
         *,
         max_global_concurrency: int = DEFAULT_GLOBAL_CONCURRENCY,
     ) -> None:
+
+        if self.__class__._initialized:
+            return
+
+        self.__class__._initialized = True
+
         self.router = APIRouter()
+
         self.started_at = time.time()
 
         self.max_global_concurrency = max(
@@ -984,29 +1480,40 @@ class GatewayRouter:
             int(max_global_concurrency),
         )
 
-        self._global_semaphore = asyncio.Semaphore(
-            self.max_global_concurrency
+        self._global_semaphore = (
+            asyncio.Semaphore(
+                self.max_global_concurrency
+            )
         )
 
-        self._runtime: Dict[str, ProviderRuntime] = {}
-        self._registry_lock = threading.RLock()
+        self._runtime: Dict[
+            str,
+            ProviderRuntime,
+        ] = {}
+
+        self._registry_lock = (
+            threading.RLock()
+        )
 
         self._total_requests = 0
         self._successful_requests = 0
         self._failed_requests = 0
 
         self._register_routes()
+
         self.refresh_registry()
 
         logger.info(
-            "Dynamic provider-agnostic gateway initialized."
+            "Canonical single GatewayRouter initialized."
         )
 
     # ------------------------------------------------------------------
     # ROUTES
     # ------------------------------------------------------------------
 
-    def _register_routes(self) -> None:
+    def _register_routes(
+        self,
+    ) -> None:
 
         @self.router.get(
             "/health",
@@ -1014,6 +1521,7 @@ class GatewayRouter:
         )
         async def health() -> Dict[str, Any]:
             snapshot = self.health_snapshot()
+
             eligible = sum(
                 1
                 for item in snapshot.values()
@@ -1031,20 +1539,27 @@ class GatewayRouter:
                     )
                 ),
                 "uptime_seconds": round(
-                    time.time() - self.started_at,
+                    time.time()
+                    - self.started_at,
                     2,
                 ),
-                "providers_total": len(snapshot),
+                "providers_total": len(
+                    snapshot
+                ),
                 "providers_eligible": eligible,
                 "active_requests": sum(
                     item["in_flight"]
                     for item in snapshot.values()
                 ),
-                "total_requests": self._total_requests,
+                "total_requests": (
+                    self._total_requests
+                ),
                 "successful_requests": (
                     self._successful_requests
                 ),
-                "failed_requests": self._failed_requests,
+                "failed_requests": (
+                    self._failed_requests
+                ),
             }
 
         @self.router.get(
@@ -1053,6 +1568,7 @@ class GatewayRouter:
         )
         async def providers() -> Dict[str, Any]:
             self.refresh_registry()
+
             return {
                 "providers": self.health_snapshot()
             }
@@ -1063,48 +1579,81 @@ class GatewayRouter:
         )
         async def routes() -> Dict[str, Any]:
             self.refresh_registry()
+
             return {
                 "routes": self.route_snapshot()
             }
 
-    def get_router(self) -> APIRouter:
+    def get_router(
+        self,
+    ) -> APIRouter:
         return self.router
 
     # ------------------------------------------------------------------
     # REGISTRY SYNCHRONIZATION
     # ------------------------------------------------------------------
 
-    def refresh_registry(self) -> None:
-        configurations = PROVIDER_REGISTRY.providers()
+    def refresh_registry(
+        self,
+    ) -> None:
+        configurations = (
+            PROVIDER_REGISTRY.providers()
+        )
 
         with self._registry_lock:
             known = set(self._runtime)
             current = set(configurations)
 
-            for removed in known - current:
-                self._runtime.pop(removed, None)
+            for removed in (
+                known - current
+            ):
+                self._runtime.pop(
+                    removed,
+                    None,
+                )
 
-            for name, configuration in configurations.items():
-                runtime = self._runtime.get(name)
+            for (
+                name,
+                configuration,
+            ) in configurations.items():
+
+                runtime = self._runtime.get(
+                    name
+                )
 
                 if runtime is None:
                     runtime = ProviderRuntime()
                     self._runtime[name] = runtime
 
                 if runtime.semaphore is None:
-                    runtime.semaphore = asyncio.Semaphore(
-                        self._provider_limit(configuration)
+                    runtime.semaphore = (
+                        asyncio.Semaphore(
+                            self._provider_limit(
+                                configuration
+                            )
+                        )
                     )
 
     def register_provider(
         self,
-        configuration: ProviderConfiguration | Mapping[str, Any],
+        configuration: (
+            ProviderConfiguration
+            | Mapping[str, Any]
+        ),
         *,
-        adapter: type[ProviderAdapter] = DynamicProviderAdapter,
+        adapter: type[
+            ProviderAdapter
+        ] = DynamicProviderAdapter,
     ) -> None:
-        if isinstance(configuration, Mapping):
-            configuration = _configuration_from_mapping(
-                configuration
+
+        if isinstance(
+            configuration,
+            Mapping,
+        ):
+            configuration = (
+                _configuration_from_mapping(
+                    configuration
+                )
             )
 
         if not isinstance(
@@ -1112,26 +1661,40 @@ class GatewayRouter:
             ProviderConfiguration,
         ):
             raise TypeError(
-                "configuration must be ProviderConfiguration or mapping."
+                (
+                    "configuration must be "
+                    "ProviderConfiguration or mapping."
+                )
             )
 
-        if not configuration.name.strip():
+        try:
+            configuration.validate()
+
+        except Exception as exc:
             raise DynamicConfigurationError(
-                "Provider name cannot be empty."
-            )
+                f"Invalid provider configuration: {exc}",
+                provider=getattr(
+                    configuration,
+                    "name",
+                    None,
+                ),
+            ) from exc
 
-        if not configuration.endpoint.strip():
-            raise DynamicConfigurationError(
-                "Provider endpoint cannot be empty.",
-                provider=configuration.name,
+        if (
+            not isinstance(
+                adapter,
+                type,
             )
-
-        if not isinstance(adapter, type) or not issubclass(
-            adapter,
-            ProviderAdapter,
+            or not issubclass(
+                adapter,
+                ProviderAdapter,
+            )
         ):
             raise DynamicConfigurationError(
-                "adapter must be a ProviderAdapter subclass.",
+                (
+                    "adapter must be a "
+                    "ProviderAdapter subclass."
+                ),
                 provider=configuration.name,
             )
 
@@ -1140,28 +1703,58 @@ class GatewayRouter:
             adapter,
         )
 
-        CIRCUIT_REGISTRY.register(
+        CIRCUIT_REGISTRY.get(
             configuration.name
         )
 
         self.refresh_registry()
 
+        logger.info(
+            "Provider registered: %s",
+            configuration.name,
+        )
+
     def unregister_provider(
         self,
         provider: str,
     ) -> bool:
-        existed = PROVIDER_REGISTRY.exists(provider)
-        PROVIDER_REGISTRY.unregister(provider)
-        self._runtime.pop(provider, None)
+        existed = (
+            PROVIDER_REGISTRY.exists(
+                provider
+            )
+        )
+
+        PROVIDER_REGISTRY.unregister(
+            provider
+        )
+
+        self._runtime.pop(
+            provider,
+            None,
+        )
+
         return existed
 
+    @classmethod
     def get_gateway(
-        self,
+        cls,
         service_type: str = "default",
     ) -> "GatewayHandle":
+
+        gateway = globals().get(
+            "gateway_router"
+        )
+
+        if not isinstance(
+            gateway,
+            cls,
+        ):
+            gateway = cls()
+
         return GatewayHandle(
-            self,
-            service_type or "default",
+            gateway,
+            service_type
+            or "default",
         )
 
     # ------------------------------------------------------------------
@@ -1179,49 +1772,94 @@ class GatewayRouter:
         Plain API-key strings are deliberately rejected.
         Provider identity must never be inferred from key prefixes.
         """
-        if not isinstance(configuration, Mapping):
+
+        if not isinstance(
+            configuration,
+            Mapping,
+        ):
             raise DynamicConfigurationError(
                 "Gateway configuration must be a mapping."
             )
 
-        normalized: Dict[str, List[Mapping[str, Any]]] = {}
+        normalized: Dict[
+            str,
+            List[Mapping[str, Any]],
+        ] = {}
 
-        for service, entries in configuration.items():
-            service_name = str(service).strip()
+        for (
+            service,
+            entries,
+        ) in configuration.items():
+
+            service_name = str(
+                service
+            ).strip()
+
             if not service_name:
                 continue
 
-            if isinstance(entries, Mapping):
+            if isinstance(
+                entries,
+                Mapping,
+            ):
                 entries = [entries]
 
-            if isinstance(entries, str):
+            if isinstance(
+                entries,
+                str,
+            ):
                 raise DynamicConfigurationError(
                     (
-                        "Plain API-key entries are unsupported. "
-                        "Use explicit provider configuration."
+                        "Plain API-key entries are "
+                        "unsupported. Use explicit "
+                        "provider configuration."
                     )
                 )
 
-            if not isinstance(entries, Sequence):
+            if not isinstance(
+                entries,
+                Sequence,
+            ):
                 continue
 
-            bucket: List[Mapping[str, Any]] = []
+            bucket: List[
+                Mapping[str, Any]
+            ] = []
 
             for entry in entries:
-                if not isinstance(entry, Mapping):
+
+                if not isinstance(
+                    entry,
+                    Mapping,
+                ):
                     continue
 
                 data = dict(entry)
+
                 services = set(
                     str(item)
-                    for item in data.get("services", ())
+                    for item in data.get(
+                        "services",
+                        (),
+                    )
                 )
-                services.add(service_name)
-                data["services"] = sorted(services)
-                bucket.append(data)
+
+                services.add(
+                    service_name
+                )
+
+                data["services"] = sorted(
+                    services
+                )
+
+                bucket.append(
+                    data
+                )
 
             if bucket:
-                normalized[service_name] = bucket
+                normalized[
+                    service_name
+                ] = bucket
 
         cls._legacy_vault = normalized
 
@@ -1238,13 +1876,19 @@ class GatewayRouter:
         temperature: float,
         max_tokens: Optional[int],
         service: str,
-        required_capabilities: Optional[Iterable[str]],
-        metadata: Optional[Mapping[str, Any]],
+        required_capabilities: Optional[
+            Iterable[str]
+        ],
+        metadata: Optional[
+            Mapping[str, Any]
+        ],
         timeout_seconds: Optional[float],
         max_failovers: int,
         routing_mode: str | RoutingMode,
         preferred_provider: Optional[str],
-        excluded_providers: Optional[Iterable[str]],
+        excluded_providers: Optional[
+            Iterable[str]
+        ],
     ) -> GatewayRequest:
 
         mode = _enum_value(
@@ -1262,29 +1906,46 @@ class GatewayRouter:
             service=service or "default",
             required_capabilities=frozenset(
                 str(value)
-                for value in (required_capabilities or ())
+                for value in (
+                    required_capabilities
+                    or ()
+                )
             ),
-            metadata=dict(metadata or {}),
-            timeout_seconds=timeout_seconds,
+            metadata=dict(
+                metadata
+                or {}
+            ),
+            timeout_seconds=(
+                timeout_seconds
+            ),
             max_failovers=max(
                 1,
                 int(max_failovers),
             ),
             routing_mode=mode,
-            preferred_provider=preferred_provider,
+            preferred_provider=(
+                preferred_provider
+            ),
             excluded_providers=frozenset(
                 str(value)
-                for value in (excluded_providers or ())
+                for value in (
+                    excluded_providers
+                    or ()
+                )
             ),
         )
 
-        GatewayRouter._validate_request(request)
+        GatewayRouter._validate_request(
+            request
+        )
+
         return request
 
     @staticmethod
     def _validate_request(
         request: GatewayRequest,
     ) -> None:
+
         if not isinstance(
             request.prompt,
             str,
@@ -1309,7 +1970,10 @@ class GatewayRouter:
             <= 2.0
         ):
             raise GatewayValidationError(
-                "Temperature must be between 0 and 2."
+                (
+                    "Temperature must be "
+                    "between 0 and 2."
+                )
             )
 
         if (
@@ -1321,7 +1985,8 @@ class GatewayRouter:
             )
 
         if (
-            request.timeout_seconds is not None
+            request.timeout_seconds
+            is not None
             and request.timeout_seconds <= 0
         ):
             raise GatewayValidationError(
@@ -1336,22 +2001,35 @@ class GatewayRouter:
     def _metadata(
         configuration: ProviderConfiguration,
     ) -> Mapping[str, Any]:
-        return configuration.metadata or {}
+
+        return (
+            configuration.metadata
+            or {}
+        )
 
     @classmethod
     def _services(
         cls,
         configuration: ProviderConfiguration,
     ) -> Set[str]:
-        raw = cls._metadata(configuration).get(
+
+        raw = cls._metadata(
+            configuration
+        ).get(
             "services",
             (),
         )
 
-        if isinstance(raw, str):
+        if isinstance(
+            raw,
+            str,
+        ):
             return {raw}
 
-        if isinstance(raw, Iterable):
+        if isinstance(
+            raw,
+            Iterable,
+        ):
             return {
                 str(item)
                 for item in raw
@@ -1364,15 +2042,24 @@ class GatewayRouter:
         cls,
         configuration: ProviderConfiguration,
     ) -> Set[str]:
-        raw = cls._metadata(configuration).get(
+
+        raw = cls._metadata(
+            configuration
+        ).get(
             "capabilities",
             (),
         )
 
-        if isinstance(raw, str):
+        if isinstance(
+            raw,
+            str,
+        ):
             return {raw}
 
-        if isinstance(raw, Iterable):
+        if isinstance(
+            raw,
+            Iterable,
+        ):
             return {
                 str(item)
                 for item in raw
@@ -1385,16 +2072,26 @@ class GatewayRouter:
         cls,
         configuration: ProviderConfiguration,
     ) -> Set[str]:
-        raw = cls._metadata(configuration).get(
+
+        raw = cls._metadata(
+            configuration
+        ).get(
             "models",
             (),
         )
 
         models: Set[str] = set()
 
-        if isinstance(raw, str):
+        if isinstance(
+            raw,
+            str,
+        ):
             models.add(raw)
-        elif isinstance(raw, Iterable):
+
+        elif isinstance(
+            raw,
+            Iterable,
+        ):
             models.update(
                 str(item)
                 for item in raw
@@ -1402,7 +2099,9 @@ class GatewayRouter:
 
         default_model = cls._metadata(
             configuration
-        ).get("default_model")
+        ).get(
+            "default_model"
+        )
 
         if default_model:
             models.add(
@@ -1420,7 +2119,10 @@ class GatewayRouter:
         cls,
         configuration: ProviderConfiguration,
     ) -> int:
-        metadata = cls._metadata(configuration)
+
+        metadata = cls._metadata(
+            configuration
+        )
 
         return max(
             1,
@@ -1446,30 +2148,45 @@ class GatewayRouter:
             ProviderRuntime,
         ]
     ]:
+
         self.refresh_registry()
 
         result = []
 
         with self._registry_lock:
-            names = sorted(self._runtime)
+            names = sorted(
+                self._runtime
+            )
 
             for name in names:
-                runtime = self._runtime[name]
+                runtime = (
+                    self._runtime[name]
+                )
 
-                if not PROVIDER_REGISTRY.exists(name):
+                if not PROVIDER_REGISTRY.exists(
+                    name
+                ):
                     continue
 
                 configuration = (
-                    PROVIDER_REGISTRY.configuration(name)
+                    PROVIDER_REGISTRY.configuration(
+                        name
+                    )
                 )
 
                 if not configuration.enabled:
                     continue
 
-                if name in request.excluded_providers:
+                if (
+                    name
+                    in request.excluded_providers
+                ):
                     continue
 
-                if runtime.cooldown_until > time.monotonic():
+                if (
+                    runtime.cooldown_until
+                    > time.monotonic()
+                ):
                     continue
 
                 services = self._services(
@@ -1478,12 +2195,15 @@ class GatewayRouter:
 
                 if (
                     services
-                    and request.service not in services
+                    and request.service
+                    not in services
                 ):
                     continue
 
-                capabilities = self._capabilities(
-                    configuration
+                capabilities = (
+                    self._capabilities(
+                        configuration
+                    )
                 )
 
                 if (
@@ -1501,25 +2221,19 @@ class GatewayRouter:
                 if (
                     request.model
                     and models
-                    and request.model not in models
+                    and request.model
+                    not in models
                 ):
                     continue
 
-                if CIRCUIT_REGISTRY is not None:
-                    health = (
-                        CIRCUIT_REGISTRY
-                        .get(name)
-                        .snapshot()
-                    )
-                    state = str(
-                        health.state
-                    ).lower()
+                health = (
+                    CIRCUIT_REGISTRY
+                    .get(name)
+                    .snapshot()
+                )
 
-                    if (
-                        state.endswith("open")
-                        and health.opened_until > time.time()
-                    ):
-                        continue
+                if health.state.name == "OPEN":
+                    continue
 
                 result.append(
                     (
@@ -1540,18 +2254,22 @@ class GatewayRouter:
         runtime: ProviderRuntime,
         mode: RoutingMode,
     ) -> float:
+
         metadata = self._metadata(
             configuration
         )
 
-        # Circuit / health.
         health_factor = 1.0
+
         if CIRCUIT_REGISTRY is not None:
             health = (
                 CIRCUIT_REGISTRY
-                .get(configuration.name)
+                .get(
+                    configuration.name
+                )
                 .snapshot()
             )
+
             health_factor = max(
                 0.01,
                 min(
@@ -1559,7 +2277,8 @@ class GatewayRouter:
                     _safe_float(
                         health.score,
                         100.0,
-                    ) / 100.0,
+                    )
+                    / 100.0,
                 ),
             )
 
@@ -1567,10 +2286,11 @@ class GatewayRouter:
                 health.state
             ).lower()
 
-            if state.endswith("half_open"):
+            if state.endswith(
+                "half_open"
+            ):
                 health_factor *= 0.25
 
-        # Latency.
         latency = (
             runtime.ema_latency_ms
             or runtime.last_latency_ms
@@ -1578,44 +2298,47 @@ class GatewayRouter:
         )
 
         latency_factor = 1.0 / (
-            1.0 + latency / 1000.0
+            1.0
+            + latency / 1000.0
         )
 
-        # Reliability.
         if runtime.total_requests > 0:
             failure_rate = (
                 runtime.failed_requests
                 / runtime.total_requests
             )
+
             reliability_factor = max(
                 0.02,
                 1.0 - failure_rate,
             )
+
         else:
-            # Small exploration bonus keeps a never-used healthy provider
-            # from being permanently starved.
             reliability_factor = 0.90
 
-        # Capacity.
         limit = self._provider_limit(
             configuration
         )
 
         utilization = (
             runtime.in_flight
-            / max(1, limit)
+            / max(
+                1,
+                limit,
+            )
         )
 
         capacity_factor = max(
             0.02,
-            1.0 - min(
+            1.0
+            - min(
                 1.0,
                 utilization,
             ),
         )
 
-        # Rate-limit headroom.
         rate_factor = 1.0
+
         configured_rate = _safe_int(
             metadata.get(
                 "rate_limit_per_minute"
@@ -1623,7 +2346,8 @@ class GatewayRouter:
         )
 
         if (
-            runtime.rate_remaining is not None
+            runtime.rate_remaining
+            is not None
             and configured_rate
         ):
             rate_factor = max(
@@ -1638,7 +2362,6 @@ class GatewayRouter:
                 ),
             )
 
-        # Cost.
         cost = _safe_float(
             metadata.get(
                 "cost_per_1k_tokens"
@@ -1647,7 +2370,8 @@ class GatewayRouter:
         )
 
         cost_factor = 1.0 / (
-            1.0 + max(
+            1.0
+            + max(
                 0.0,
                 cost,
             )
@@ -1674,7 +2398,8 @@ class GatewayRouter:
         )
 
         priority_factor = 1.0 / (
-            1.0 + priority / 100.0
+            1.0
+            + priority / 100.0
         )
 
         if mode == RoutingMode.LOW_LATENCY:
@@ -1738,67 +2463,70 @@ class GatewayRouter:
         ProviderConfiguration,
         ProviderRuntime,
     ]:
+
         if not candidates:
             raise ProviderUnavailableError(
                 "No eligible dynamic provider exists.",
                 category="routing",
             )
 
-        preferred = [
-            item
-            for item in candidates
-            if (
-                request.preferred_provider
-                and item[0].name
-                == request.preferred_provider
-            )
-        ]
+        ranked = []
 
-        if preferred:
-            return max(
-                preferred,
-                key=lambda item: self._score(
-                    item[0],
-                    item[1],
-                    request.routing_mode,
-                ),
+        for (
+            configuration,
+            runtime,
+        ) in candidates:
+
+            score = self._score(
+                configuration,
+                runtime,
+                request.routing_mode,
             )
 
-        weighted = [
-            (
-                item,
-                self._score(
-                    item[0],
-                    item[1],
-                    request.routing_mode,
-                ),
+            ranked.append(
+                (
+                    score,
+                    configuration.name,
+                    configuration,
+                    runtime,
+                )
             )
-            for item in candidates
-        ]
 
-        total = sum(
-            score
-            for _, score in weighted
+        ranked.sort(
+            key=lambda item: (
+                -item[0],
+                item[1],
+            )
         )
 
-        if not math.isfinite(total) or total <= 0:
-            return min(
-                candidates,
-                key=lambda item: (
-                    item[1].in_flight,
-                    item[0].name,
-                ),
-            )
+        if request.preferred_provider:
 
-        target = random.random() * total
-        cursor = 0.0
+            preferred = [
+                item
+                for item in ranked
+                if (
+                    item[1]
+                    == request.preferred_provider
+                )
+            ]
 
-        for item, score in weighted:
-            cursor += score
-            if target <= cursor:
-                return item
+            if preferred:
+                return (
+                    preferred[0][2],
+                    preferred[0][3],
+                )
 
-        return weighted[-1][0]
+        (
+            _,
+            _,
+            configuration,
+            runtime,
+        ) = ranked[0]
+
+        return (
+            configuration,
+            runtime,
+        )
 
     # ------------------------------------------------------------------
     # EXECUTION
@@ -1835,17 +2563,21 @@ class GatewayRouter:
             temperature=temperature,
             max_tokens=max_tokens,
             service=service,
-            required_capabilities=required_capabilities,
+            required_capabilities=(
+                required_capabilities
+            ),
             metadata=metadata,
             timeout_seconds=timeout_seconds,
             max_failovers=max_failovers,
             routing_mode=routing_mode,
-            preferred_provider=preferred_provider,
-            excluded_providers=excluded_providers,
+            preferred_provider=(
+                preferred_provider
+            ),
+            excluded_providers=(
+                excluded_providers
+            ),
         )
 
-        # One logical gateway request; provider failovers are attempts of the
-        # same request and are tracked separately below.
         self._total_requests += 1
 
         if not HTTP_CLIENT.initialized():
@@ -1858,58 +2590,78 @@ class GatewayRouter:
         if not candidates:
             raise ProviderUnavailableError(
                 (
-                    "No registered provider matches "
-                    "service/capability/model constraints."
+                    "No registered provider "
+                    "matches service/capability/"
+                    "model constraints."
                 ),
                 category="routing",
             )
 
-        # max_failovers means maximum provider execution slots tried.
         max_attempts = min(
             len(candidates),
             request.max_failovers,
         )
 
         attempted: Set[str] = set()
-        last_error: Optional[GatewayError] = None
+
+        last_error: Optional[
+            GatewayError
+        ] = None
 
         for attempt in range(
             1,
             max_attempts + 1,
         ):
+
             available = [
                 item
-                for item in self._candidates(request)
+                for item in self._candidates(
+                    request
+                )
                 if (
-                    item[0].name not in attempted
+                    item[0].name
+                    not in attempted
                 )
             ]
 
             if not available:
                 break
 
-            configuration, runtime = self._select(
+            (
+                configuration,
+                runtime,
+            ) = self._select(
                 available,
                 request,
             )
 
-            runtime.last_selection_score = self._score(
-                configuration,
-                runtime,
-                request.routing_mode,
+            runtime.last_selection_score = (
+                self._score(
+                    configuration,
+                    runtime,
+                    request.routing_mode,
+                )
             )
-            runtime.last_selected_at = time.time()
+
+            runtime.last_selected_at = (
+                time.time()
+            )
 
             provider = configuration.name
-            attempted.add(provider)
+
+            attempted.add(
+                provider
+            )
 
             started = time.perf_counter()
 
             try:
-                provider_response = await self._execute_provider(
-                    configuration,
-                    runtime,
-                    request,
+                provider_response = (
+                    await self._execute_provider(
+                        configuration,
+                        runtime,
+                        request,
+                    )
                 )
 
                 elapsed_ms = (
@@ -1926,8 +2678,10 @@ class GatewayRouter:
                 self._successful_requests += 1
 
                 metadata_out = dict(
-                    provider_response.metadata or {}
+                    provider_response.metadata
+                    or {}
                 )
+
                 metadata_out.update(
                     {
                         "gateway_attempt": attempt,
@@ -1935,7 +2689,9 @@ class GatewayRouter:
                         "routing_mode": (
                             request.routing_mode.value
                         ),
-                        "request_id": request.request_id,
+                        "request_id": (
+                            request.request_id
+                        ),
                         "provider_protocol": (
                             configuration.protocol.value
                         ),
@@ -1950,7 +2706,9 @@ class GatewayRouter:
                         request.model
                         or self._metadata(
                             configuration
-                        ).get("default_model")
+                        ).get(
+                            "default_model"
+                        )
                     ),
                     request_id=(
                         provider_response.metadata.get(
@@ -1976,6 +2734,7 @@ class GatewayRouter:
 
             except GatewayError as exc:
                 last_error = exc
+
                 elapsed_ms = (
                     time.perf_counter()
                     - started
@@ -1986,10 +2745,9 @@ class GatewayRouter:
                     exc,
                     elapsed_ms,
                 )
+
                 self._failed_requests += 1
 
-                # ProviderExecutor already performed its configured retry
-                # policy. Gateway now chooses a different provider.
                 continue
 
             except Exception as exc:
@@ -2012,7 +2770,9 @@ class GatewayRouter:
                     wrapped,
                     elapsed_ms,
                 )
+
                 self._failed_requests += 1
+
                 continue
 
         if last_error is not None:
@@ -2031,18 +2791,28 @@ class GatewayRouter:
     ) -> ProviderResponse:
 
         if runtime.semaphore is None:
-            runtime.semaphore = asyncio.Semaphore(
-                self._provider_limit(configuration)
+            runtime.semaphore = (
+                asyncio.Semaphore(
+                    self._provider_limit(
+                        configuration
+                    )
+                )
             )
 
         async with self._global_semaphore:
+
             async with runtime.semaphore:
+
                 runtime.in_flight += 1
+
                 try:
-                    return await self._execute_with_circuit(
-                        configuration,
-                        request,
+                    return (
+                        await self._execute_with_circuit(
+                            configuration,
+                            request,
+                        )
                     )
+
                 finally:
                     runtime.in_flight = max(
                         0,
@@ -2063,7 +2833,9 @@ class GatewayRouter:
             metadata={
                 **request.metadata,
                 "model": request.model,
-                "gateway_request_id": request.request_id,
+                "gateway_request_id": (
+                    request.request_id
+                ),
                 "timeout_seconds": (
                     request.timeout_seconds
                     or configuration.timeout_seconds
@@ -2072,11 +2844,11 @@ class GatewayRouter:
         )
 
         async def operation() -> ProviderResponse:
+
             adapter = PROVIDER_REGISTRY.create(
                 configuration.name
             )
 
-            # Custom adapters registered in ProviderRegistry are authoritative.
             return await adapter.invoke(
                 sdk_request
             )
@@ -2102,8 +2874,7 @@ class GatewayRouter:
                 category="timeout",
             ) from exc
 
-        except RuntimeError as exc:
-            # ProviderExecutor uses RuntimeError for an open circuit.
+        except CircuitOpenError as exc:
             raise ProviderUnavailableError(
                 str(exc),
                 provider=configuration.name,
@@ -2121,13 +2892,20 @@ class GatewayRouter:
         response: ProviderResponse,
         latency_ms: float,
     ) -> None:
+
         async with runtime.lock:
+
             runtime.total_requests += 1
             runtime.successful_requests += 1
             runtime.last_latency_ms = latency_ms
 
-            if runtime.ema_latency_ms <= 0:
-                runtime.ema_latency_ms = latency_ms
+            if (
+                runtime.ema_latency_ms
+                <= 0
+            ):
+                runtime.ema_latency_ms = (
+                    latency_ms
+                )
             else:
                 runtime.ema_latency_ms = (
                     runtime.ema_latency_ms * 0.8
@@ -2136,11 +2914,18 @@ class GatewayRouter:
 
             runtime.consecutive_successes += 1
             runtime.consecutive_failures = 0
-            runtime.last_success_at = time.time()
+
+            runtime.last_success_at = (
+                time.time()
+            )
+
             runtime.cooldown_until = 0.0
             runtime.last_error = None
 
-            metadata = response.metadata or {}
+            metadata = (
+                response.metadata
+                or {}
+            )
 
             remaining = _safe_int(
                 metadata.get(
@@ -2149,7 +2934,9 @@ class GatewayRouter:
             )
 
             if remaining is not None:
-                runtime.rate_remaining = remaining
+                runtime.rate_remaining = (
+                    remaining
+                )
 
             reset = _safe_float(
                 metadata.get(
@@ -2159,7 +2946,9 @@ class GatewayRouter:
             )
 
             if reset > 0:
-                runtime.rate_reset_at = reset
+                runtime.rate_reset_at = (
+                    reset
+                )
 
             runtime.bytes_sent += (
                 _safe_int(
@@ -2202,17 +2991,42 @@ class GatewayRouter:
             )
 
             cost_per_1k = _safe_float(
-                metadata.get("cost_per_1k_tokens"),
+                metadata.get(
+                    "cost_per_1k_tokens"
+                ),
                 0.0,
             )
 
             if cost_per_1k > 0:
-                total_tokens = (
-                    runtime.estimated_tokens_in
-                    + runtime.estimated_tokens_out
+
+                request_input_tokens = (
+                    _safe_int(
+                        metadata.get(
+                            "estimated_input_tokens"
+                        ),
+                        0,
+                    )
+                    or 0
                 )
+
+                request_output_tokens = (
+                    _safe_int(
+                        metadata.get(
+                            "estimated_output_tokens"
+                        ),
+                        0,
+                    )
+                    or 0
+                )
+
+                request_tokens = (
+                    request_input_tokens
+                    + request_output_tokens
+                )
+
                 runtime.estimated_cost += (
-                    total_tokens / 1000.0
+                    request_tokens
+                    / 1000.0
                 ) * cost_per_1k
 
     async def _record_failure(
@@ -2221,13 +3035,20 @@ class GatewayRouter:
         error: GatewayError,
         latency_ms: float,
     ) -> None:
+
         async with runtime.lock:
+
             runtime.total_requests += 1
             runtime.failed_requests += 1
             runtime.last_latency_ms = latency_ms
 
-            if runtime.ema_latency_ms <= 0:
-                runtime.ema_latency_ms = latency_ms
+            if (
+                runtime.ema_latency_ms
+                <= 0
+            ):
+                runtime.ema_latency_ms = (
+                    latency_ms
+                )
             else:
                 runtime.ema_latency_ms = (
                     runtime.ema_latency_ms * 0.8
@@ -2236,11 +3057,15 @@ class GatewayRouter:
 
             runtime.consecutive_failures += 1
             runtime.consecutive_successes = 0
-            runtime.last_failure_at = time.time()
-            runtime.last_error = str(error)[:1000]
 
-            # Local admission cooldown complements the circuit breaker.
-            # It does not replace it or retry the request.
+            runtime.last_failure_at = (
+                time.time()
+            )
+
+            runtime.last_error = str(
+                error
+            )[:1000]
+
             failure_level = min(
                 6,
                 runtime.consecutive_failures,
@@ -2250,9 +3075,12 @@ class GatewayRouter:
                 time.monotonic()
                 + min(
                     30.0,
-                    0.5 * (
-                        2 ** (
-                            failure_level - 1
+                    0.5
+                    * (
+                        2
+                        ** (
+                            failure_level
+                            - 1
                         )
                     ),
                 )
@@ -2271,9 +3099,14 @@ class GatewayRouter:
 
         self.refresh_registry()
 
-        if not PROVIDER_REGISTRY.exists(provider):
+        if not PROVIDER_REGISTRY.exists(
+            provider
+        ):
             raise ProviderUnavailableError(
-                f"Provider '{provider}' is not registered.",
+                (
+                    f"Provider '{provider}' "
+                    "is not registered."
+                ),
                 provider=provider,
             )
 
@@ -2284,6 +3117,7 @@ class GatewayRouter:
             cached = await MODEL_CACHE.get_models(
                 provider
             )
+
             if cached is not None:
                 return list(cached)
 
@@ -2295,7 +3129,9 @@ class GatewayRouter:
 
         discovery = self._metadata(
             configuration
-        ).get("model_discovery")
+        ).get(
+            "model_discovery"
+        )
 
         models: List[str] = []
 
@@ -2303,11 +3139,13 @@ class GatewayRouter:
             discovery,
             Mapping,
         ):
+
             endpoint = discovery.get(
                 "endpoint"
             )
 
             if endpoint:
+
                 method = str(
                     discovery.get(
                         "method",
@@ -2315,98 +3153,177 @@ class GatewayRouter:
                     )
                 ).upper()
 
-                response_path = discovery.get(
-                    "response_path",
-                    "models",
+                response_path = (
+                    discovery.get(
+                        "response_path",
+                        "models",
+                    )
                 )
 
-                model_path = discovery.get(
-                    "model_path"
+                model_path = (
+                    discovery.get(
+                        "model_path"
+                    )
                 )
 
-                adapter = DynamicProviderAdapter(
-                    configuration
-                )
-
-                async with self._global_semaphore:
-                    async with self._runtime_for(
+                adapter = (
+                    DynamicProviderAdapter(
                         configuration
-                    ).semaphore_context():
-                        session = HTTP_CLIENT.session()
+                    )
+                )
 
-                        async with session.request(
-                            method,
-                            str(endpoint),
-                            headers=adapter.build_headers(),
-                            params=adapter.build_query(),
-                            timeout=aiohttp.ClientTimeout(
-                                total=configuration.timeout_seconds
-                            ),
-                        ) as response:
+                runtime_handle = (
+                    self._runtime_for(
+                        configuration
+                    )
+                )
 
-                            body = await response.read()
+                async def operation() -> tuple[
+                    int,
+                    Mapping[str, str],
+                    bytes,
+                ]:
 
-                            if response.status >= 400:
-                                raise ProviderExecutionError(
-                                    (
-                                        "Dynamic model discovery failed: "
-                                        f"HTTP {response.status}"
-                                    ),
-                                    provider=provider,
-                                    status=response.status,
-                                    retryable=(
-                                        response.status
-                                        in RETRYABLE_HTTP_CODES
-                                    ),
-                                    category="model_discovery",
+                    session = (
+                        HTTP_CLIENT.session()
+                    )
+
+                    async with session.request(
+                        method,
+                        str(endpoint),
+                        headers=(
+                            adapter.build_headers()
+                        ),
+                        params=(
+                            adapter.build_query()
+                        ),
+                        timeout=(
+                            aiohttp.ClientTimeout(
+                                total=(
+                                    configuration
+                                    .timeout_seconds
                                 )
+                            )
+                        ),
+                    ) as response:
 
-                            if len(body) > MAX_RESPONSE_BYTES:
-                                raise ProviderExecutionError(
-                                    "Model discovery response is too large.",
-                                    provider=provider,
-                                    category="model_discovery",
-                                )
+                        body = await response.read()
 
-                            content_type = response.headers.get(
-                                "Content-Type",
-                                "",
-                            ).lower()
-
-                            if "json" in content_type:
-                                payload = json.loads(
-                                    body.decode(
-                                        "utf-8",
-                                        errors="replace",
-                                    )
-                                )
-                            else:
-                                payload = body.decode(
-                                    "utf-8",
-                                    errors="replace",
-                                )
-
-                            values = _extract_path(
-                                payload,
-                                response_path,
-                                [],
+                        if (
+                            len(body)
+                            > MAX_RESPONSE_BYTES
+                        ):
+                            raise ProviderExecutionError(
+                                (
+                                    "Model discovery "
+                                    "response is too large."
+                                ),
+                                provider=provider,
+                                status=response.status,
+                                retryable=False,
+                                category=(
+                                    "model_discovery"
+                                ),
                             )
 
-                            if isinstance(values, list):
-                                for item in values:
-                                    if model_path:
-                                        item = _extract_path(
-                                            item,
-                                            model_path,
-                                        )
-                                    if item is not None:
-                                        models.append(
-                                            str(item)
-                                        )
+                        if response.status >= 400:
+                            raise ProviderExecutionError(
+                                (
+                                    "Dynamic model "
+                                    "discovery failed: "
+                                    f"HTTP {response.status}"
+                                ),
+                                provider=provider,
+                                status=response.status,
+                                retryable=(
+                                    response.status
+                                    in RETRYABLE_HTTP_CODES
+                                ),
+                                category=(
+                                    "model_discovery"
+                                ),
+                            )
+
+                        return (
+                            response.status,
+                            dict(
+                                response.headers
+                            ),
+                            body,
+                        )
+
+                async with (
+                    self._global_semaphore
+                ):
+
+                    async with (
+                        runtime_handle
+                        .semaphore_context()
+                    ):
+
+                        (
+                            status,
+                            response_headers,
+                            body,
+                        ) = await (
+                            PROVIDER_EXECUTOR.execute(
+                                provider,
+                                operation,
+                            )
+                        )
+
+                content_type = (
+                    response_headers.get(
+                        "Content-Type",
+                        "",
+                    ).lower()
+                )
+
+                if "json" in content_type:
+
+                    payload = json.loads(
+                        body.decode(
+                            "utf-8",
+                            errors="replace",
+                        )
+                    )
+
+                else:
+
+                    payload = body.decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+
+                values = _extract_path(
+                    payload,
+                    response_path,
+                    [],
+                )
+
+                if isinstance(
+                    values,
+                    list,
+                ):
+
+                    for item in values:
+
+                        if model_path:
+                            item = _extract_path(
+                                item,
+                                model_path,
+                            )
+
+                        if item is not None:
+                            models.append(
+                                str(item)
+                            )
 
         if not models:
             models = sorted(
-                self._models(configuration)
+                self._models(
+                    configuration
+                )
             )
 
         models = list(
@@ -2433,51 +3350,78 @@ class GatewayRouter:
     def health_snapshot(
         self,
     ) -> Dict[str, Any]:
+
         self.refresh_registry()
 
-        snapshot: Dict[str, Any] = {}
-        now = time.time()
+        snapshot: Dict[
+            str,
+            Any,
+        ] = {}
 
         with self._registry_lock:
-            for name, runtime in self._runtime.items():
-                if not PROVIDER_REGISTRY.exists(name):
+
+            for (
+                name,
+                runtime,
+            ) in self._runtime.items():
+
+                if not PROVIDER_REGISTRY.exists(
+                    name
+                ):
                     continue
 
                 configuration = (
-                    PROVIDER_REGISTRY.configuration(name)
+                    PROVIDER_REGISTRY.configuration(
+                        name
+                    )
                 )
 
                 state = "unknown"
                 score = 100.0
                 opened_until = 0.0
 
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(
+                    Exception
+                ):
+
                     health = (
                         CIRCUIT_REGISTRY
                         .get(name)
                         .snapshot()
                     )
+
                     state = str(
                         health.state
-                    ).split(".")[-1].lower()
+                    ).split(
+                        "."
+                    )[-1].lower()
+
                     score = _safe_float(
                         health.score,
                         100.0,
                     )
+
                     opened_until = _safe_float(
                         health.opened_until,
                         0.0,
                     )
 
                 snapshot[name] = {
-                    "enabled": configuration.enabled,
+                    "enabled": (
+                        configuration.enabled
+                    ),
                     "eligible": (
                         configuration.enabled
-                        and runtime.cooldown_until
-                        <= time.monotonic()
+                        and (
+                            runtime.cooldown_until
+                            <= time.monotonic()
+                        )
                         and not (
-                            state.endswith("open")
-                            and opened_until > now
+                            state.endswith(
+                                "open"
+                            )
+                            and opened_until
+                            > time.time()
                         )
                     ),
                     "protocol": (
@@ -2519,8 +3463,12 @@ class GatewayRouter:
                     ),
                     "health_score": score,
                     "circuit_state": state,
-                    "circuit_open_until": opened_until,
-                    "in_flight": runtime.in_flight,
+                    "circuit_open_until": (
+                        opened_until
+                    ),
+                    "in_flight": (
+                        runtime.in_flight
+                    ),
                     "avg_latency_ms": round(
                         runtime.ema_latency_ms,
                         2,
@@ -2554,8 +3502,12 @@ class GatewayRouter:
                         runtime.last_selection_score,
                         6,
                     ),
-                    "last_selected_at": runtime.last_selected_at,
-                    "last_error": runtime.last_error,
+                    "last_selected_at": (
+                        runtime.last_selected_at
+                    ),
+                    "last_error": (
+                        runtime.last_error
+                    ),
                     "credential_fingerprint": (
                         _fingerprint(
                             configuration
@@ -2570,55 +3522,79 @@ class GatewayRouter:
     def route_snapshot(
         self,
     ) -> Dict[str, Any]:
+
         self.refresh_registry()
 
-        routes: Dict[str, List[str]] = {}
+        routes: Dict[
+            str,
+            List[str],
+        ] = {}
 
-        for name in sorted(self._runtime):
-            if not PROVIDER_REGISTRY.exists(name):
+        for name in sorted(
+            self._runtime
+        ):
+
+            if not PROVIDER_REGISTRY.exists(
+                name
+            ):
                 continue
 
             configuration = (
-                PROVIDER_REGISTRY.configuration(name)
+                PROVIDER_REGISTRY.configuration(
+                    name
+                )
             )
 
             services = self._services(
                 configuration
             )
+
             if not services:
-                services = {"default"}
+                services = {
+                    "default"
+                }
 
             for service in services:
+
                 routes.setdefault(
                     service,
                     [],
-                ).append(name)
+                ).append(
+                    name
+                )
 
         return {
             service: sorted(
                 providers
             )
-            for service, providers
-            in routes.items()
+            for (
+                service,
+                providers,
+            ) in routes.items()
         }
 
     def _runtime_for(
         self,
         configuration: ProviderConfiguration,
     ) -> "RuntimeHandle":
+
         runtime = self._runtime.setdefault(
             configuration.name,
             ProviderRuntime(),
         )
 
         if runtime.semaphore is None:
-            runtime.semaphore = asyncio.Semaphore(
-                self._provider_limit(
-                    configuration
+            runtime.semaphore = (
+                asyncio.Semaphore(
+                    self._provider_limit(
+                        configuration
+                    )
                 )
             )
 
-        return RuntimeHandle(runtime)
+        return RuntimeHandle(
+            runtime
+        )
 
 
 # ============================================================================
@@ -2635,11 +3611,15 @@ class RuntimeHandle:
     class _SemaphoreContext:
         def __init__(
             self,
-            semaphore: Optional[asyncio.Semaphore],
+            semaphore: Optional[
+                asyncio.Semaphore
+            ],
         ) -> None:
             self.semaphore = semaphore
 
-        async def __aenter__(self):
+        async def __aenter__(
+            self,
+        ):
             if self.semaphore is not None:
                 await self.semaphore.acquire()
 
@@ -2652,7 +3632,9 @@ class RuntimeHandle:
             if self.semaphore is not None:
                 self.semaphore.release()
 
-    def semaphore_context(self):
+    def semaphore_context(
+        self,
+    ):
         return self._SemaphoreContext(
             self.runtime.semaphore
         )
@@ -2665,10 +3647,18 @@ class RuntimeHandle:
 class BaseGateway:
     """Minimal synchronous/asynchronous gateway contract."""
 
-    async def agenerate(self, prompt: str, **kwargs: Any) -> GatewayResponse:
+    async def agenerate(
+        self,
+        prompt: str,
+        **kwargs: Any,
+    ) -> GatewayResponse:
         raise NotImplementedError
 
-    def generate(self, prompt: str, **kwargs: Any) -> str:
+    def generate(
+        self,
+        prompt: str,
+        **kwargs: Any,
+    ) -> str:
         raise NotImplementedError
 
 
@@ -2680,7 +3670,8 @@ class GatewayHandle(BaseGateway):
     """
     Compatibility facade for existing agents.
 
-    It never pins the request to one provider. Routing stays dynamic.
+    It never pins the request to one provider.
+    Routing stays dynamic.
     """
 
     def __init__(
@@ -2696,10 +3687,12 @@ class GatewayHandle(BaseGateway):
         prompt: str,
         **kwargs: Any,
     ) -> GatewayResponse:
+
         kwargs.setdefault(
             "service",
             self.service,
         )
+
         return await self.gateway.generate(
             prompt,
             **kwargs,
@@ -2710,9 +3703,12 @@ class GatewayHandle(BaseGateway):
         prompt: str,
         **kwargs: Any,
     ) -> str:
+
         try:
             asyncio.get_running_loop()
+
         except RuntimeError:
+
             return asyncio.run(
                 self.agenerate(
                     prompt,
@@ -2722,7 +3718,8 @@ class GatewayHandle(BaseGateway):
 
         raise RuntimeError(
             (
-                "Use 'await gateway.agenerate(...)' "
+                "Use "
+                "'await gateway.agenerate(...)' "
                 "inside an active event loop."
             )
         )
@@ -2735,6 +3732,7 @@ class GatewayHandle(BaseGateway):
 def _load_environment_configuration(
     gateway: GatewayRouter,
 ) -> None:
+
     raw = os.getenv(
         "RIOT_PROVIDERS_JSON"
     )
@@ -2743,31 +3741,52 @@ def _load_environment_configuration(
         return
 
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(
+            raw
+        )
+
     except json.JSONDecodeError as exc:
         logger.error(
-            "RIOT_PROVIDERS_JSON is invalid JSON: %s",
+            (
+                "RIOT_PROVIDERS_JSON "
+                "is invalid JSON: %s"
+            ),
             exc,
         )
+
         return
 
-    if not isinstance(parsed, list):
+    if not isinstance(
+        parsed,
+        list,
+    ):
         logger.error(
             "RIOT_PROVIDERS_JSON must be a list."
         )
+
         return
 
     for item in parsed:
-        if not isinstance(item, Mapping):
+
+        if not isinstance(
+            item,
+            Mapping,
+        ):
             continue
 
         try:
             gateway.register_provider(
-                _configuration_from_mapping(item)
+                _configuration_from_mapping(
+                    item
+                )
             )
+
         except Exception as exc:
             logger.error(
-                "Dynamic provider registration failed: %s",
+                (
+                    "Dynamic provider "
+                    "registration failed: %s"
+                ),
                 exc,
             )
 
@@ -2777,6 +3796,7 @@ def _load_environment_configuration(
 # ============================================================================
 
 gateway_router = GatewayRouter()
+
 _load_environment_configuration(
     gateway_router
 )
