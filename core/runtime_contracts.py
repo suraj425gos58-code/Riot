@@ -30,6 +30,7 @@ Design rules
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from enum import Enum
 from hashlib import sha256
@@ -39,7 +40,6 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from core.game_project import (
-    BuildStatus,
     CapabilityStatus,
     ProjectStatus,
     RuntimeType,
@@ -70,16 +70,23 @@ MAX_LOG_LENGTH = 32_768
 # ============================================================================
 
 def utc_now() -> datetime:
+    """Return the current UTC timestamp."""
     return datetime.now(timezone.utc)
 
 
 def new_runtime_id(prefix: str = "") -> str:
+    """
+    Generate a collision-resistant runtime identifier.
+
+    UUID4 provides sufficient uniqueness for local/runtime orchestration.
+    """
     value = uuid4().hex
     result = f"{prefix}{value}"
     return result[:MAX_ID_LENGTH]
 
 
 def content_sha256(value: str | bytes) -> str:
+    """Return SHA-256 for text or binary content."""
     payload = (
         value.encode("utf-8")
         if isinstance(value, str)
@@ -89,6 +96,7 @@ def content_sha256(value: str | bytes) -> str:
 
 
 def _clean(value: Any, default: str = "") -> str:
+    """Normalize a value into bounded text."""
     text = str(value or "").strip()
     return (text or default)[:MAX_DESCRIPTION_LENGTH]
 
@@ -97,6 +105,7 @@ def _bounded_unique(
     values: Iterable[Any],
     limit: int,
 ) -> List[str]:
+    """Return bounded, ordered, unique string values."""
     result: List[str] = []
     seen: Set[str] = set()
 
@@ -113,6 +122,30 @@ def _bounded_unique(
             break
 
     return result
+
+
+def _canonical_model_json(
+    value: BaseModel,
+) -> str:
+    """
+    Produce deterministic canonical JSON.
+
+    Pydantic's model_dump_json() does not expose sort_keys in a portable way,
+    so sorting is deliberately performed by Python's JSON serializer.
+    """
+    payload = value.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=False,
+        round_trip=True,
+    )
+
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 # ============================================================================
@@ -206,29 +239,49 @@ class RuntimeExecutionMode(str, Enum):
 
 class RuntimeCapability(RuntimeContract):
     name: str
-    status: CapabilityStatus = CapabilityStatus.NOT_CONFIGURED
+
+    status: CapabilityStatus = (
+        CapabilityStatus.NOT_CONFIGURED
+    )
+
     version: Optional[str] = None
     provider: Optional[str] = None
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict
+    )
 
     @field_validator("name")
     @classmethod
-    def validate_name(cls, value: str) -> str:
+    def validate_name(
+        cls,
+        value: str,
+    ) -> str:
         value = str(value).strip()
 
         if not value:
-            raise ValueError("Runtime capability name cannot be empty.")
+            raise ValueError(
+                "Runtime capability name cannot be empty."
+            )
 
         return value[:MAX_NAME_LENGTH]
 
 
 class RuntimeCapabilitySet(RuntimeContract):
-    capabilities: Dict[str, RuntimeCapability] = Field(
+    capabilities: Dict[
+        str,
+        RuntimeCapability,
+    ] = Field(
         default_factory=dict
     )
 
-    def add(self, capability: RuntimeCapability) -> None:
-        self.capabilities[capability.name] = capability
+    def add(
+        self,
+        capability: RuntimeCapability,
+    ) -> None:
+        self.capabilities[
+            capability.name
+        ] = capability
 
     def get(
         self,
@@ -275,22 +328,29 @@ class RuntimeArtifactReference(RuntimeContract):
     reference_id: str = Field(
         default_factory=lambda: new_runtime_id("ref_")
     )
+
     kind: str
+
     path: Optional[str] = None
     uri: Optional[str] = None
     checksum: Optional[str] = None
     media_type: Optional[str] = None
+
     size_bytes: Optional[int] = Field(
         default=None,
         ge=0,
     )
+
     verified: bool = False
+
     metadata: Dict[str, Any] = Field(
         default_factory=dict
     )
 
     @model_validator(mode="after")
-    def validate_reference(self) -> "RuntimeArtifactReference":
+    def validate_reference(
+        self,
+    ) -> "RuntimeArtifactReference":
         if not self.path and not self.uri:
             raise ValueError(
                 "RuntimeArtifactReference requires path or uri."
@@ -306,6 +366,7 @@ class RuntimeArtifactReference(RuntimeContract):
 class RuntimeTargetContract(RuntimeContract):
     runtime_type: RuntimeType
     target_platform: TargetPlatform
+
     name: str
     version: Optional[str] = None
 
@@ -328,25 +389,31 @@ class RuntimeTargetContract(RuntimeContract):
 
 class RuntimeEntityState(RuntimeContract):
     entity_id: str
+
     active: bool = True
+
     position: Tuple[float, float, float] = (
         0.0,
         0.0,
         0.0,
     )
+
     rotation: Tuple[float, float, float] = (
         0.0,
         0.0,
         0.0,
     )
+
     velocity: Tuple[float, float, float] = (
         0.0,
         0.0,
         0.0,
     )
+
     properties: Dict[str, Any] = Field(
         default_factory=dict
     )
+
     components: Set[str] = Field(
         default_factory=set
     )
@@ -366,7 +433,10 @@ class RuntimeEntityState(RuntimeContract):
                 "Runtime vectors must contain exactly three values."
             )
 
-        return tuple(float(item) for item in value)
+        return tuple(
+            float(item)
+            for item in value
+        )
 
 
 class RuntimeWorldState(RuntimeContract):
@@ -387,7 +457,10 @@ class RuntimeWorldState(RuntimeContract):
         gt=0.0,
     )
 
-    entities: Dict[str, RuntimeEntityState] = Field(
+    entities: Dict[
+        str,
+        RuntimeEntityState,
+    ] = Field(
         default_factory=dict
     )
 
@@ -439,14 +512,6 @@ class RuntimeCommand(RuntimeContract):
     metadata: Dict[str, Any] = Field(
         default_factory=dict
     )
-
-    @field_validator("command_type")
-    @classmethod
-    def normalize_command_type(
-        cls,
-        value: RuntimeCommandType,
-    ) -> RuntimeCommandType:
-        return value
 
 
 # ============================================================================
@@ -553,7 +618,9 @@ class RuntimeFrame(RuntimeContract):
     )
 
     @model_validator(mode="after")
-    def validate_frame_size(self) -> "RuntimeFrame":
+    def validate_frame_size(
+        self,
+    ) -> "RuntimeFrame":
         if len(self.commands) > MAX_COMMANDS_PER_FRAME:
             raise ValueError(
                 "RuntimeFrame exceeds MAX_COMMANDS_PER_FRAME."
@@ -596,7 +663,9 @@ class RuntimeExecutionRequest(RuntimeContract):
         default_factory=list
     )
 
-    initial_state: Optional[RuntimeWorldState] = None
+    initial_state: Optional[
+        RuntimeWorldState
+    ] = None
 
     requested_frame_count: Optional[int] = Field(
         default=None,
@@ -628,7 +697,9 @@ class RuntimeExecutionRequest(RuntimeContract):
     )
 
     @model_validator(mode="after")
-    def validate_request(self) -> "RuntimeExecutionRequest":
+    def validate_request(
+        self,
+    ) -> "RuntimeExecutionRequest":
         if len(self.commands) > MAX_BATCH_SIZE:
             raise ValueError(
                 "RuntimeExecutionRequest contains too many commands."
@@ -639,7 +710,10 @@ class RuntimeExecutionRequest(RuntimeContract):
                 "RuntimeExecutionRequest contains too many dependencies."
             )
 
-        if len(self.input_artifacts) > MAX_OUTPUT_REFERENCES:
+        if (
+            len(self.input_artifacts)
+            > MAX_OUTPUT_REFERENCES
+        ):
             raise ValueError(
                 "RuntimeExecutionRequest contains too many artifacts."
             )
@@ -745,8 +819,8 @@ class RuntimeExecutionResult(RuntimeContract):
     Canonical result returned by a runtime backend.
 
     `COMPLETED` means the backend completed the requested execution contract;
-    it does not automatically mean the produced game is QA-passed or build-
-    ready.
+    it does not automatically mean the produced game is QA-passed or
+    build-ready.
     """
 
     request_id: str
@@ -763,9 +837,13 @@ class RuntimeExecutionResult(RuntimeContract):
         ge=0,
     )
 
-    final_state: Optional[RuntimeWorldState] = None
+    final_state: Optional[
+        RuntimeWorldState
+    ] = None
 
-    final_frame: Optional[RuntimeFrame] = None
+    final_frame: Optional[
+        RuntimeFrame
+    ] = None
 
     metrics: RuntimeMetrics = Field(
         default_factory=RuntimeMetrics
@@ -797,17 +875,23 @@ class RuntimeExecutionResult(RuntimeContract):
     )
 
     @model_validator(mode="after")
-    def validate_result(self) -> "RuntimeExecutionResult":
+    def validate_result(
+        self,
+    ) -> "RuntimeExecutionResult":
         if (
             self.status
             is RuntimeExecutionStatus.COMPLETED
             and self.completed_at is None
         ):
             raise ValueError(
-                "COMPLETED RuntimeExecutionResult requires completed_at."
+                "COMPLETED RuntimeExecutionResult "
+                "requires completed_at."
             )
 
-        if len(self.output_artifacts) > MAX_OUTPUT_REFERENCES:
+        if (
+            len(self.output_artifacts)
+            > MAX_OUTPUT_REFERENCES
+        ):
             raise ValueError(
                 "RuntimeExecutionResult contains too many artifacts."
             )
@@ -874,7 +958,9 @@ class RuntimeStageContract(RuntimeContract):
     )
 
     @model_validator(mode="after")
-    def validate_stage(self) -> "RuntimeStageContract":
+    def validate_stage(
+        self,
+    ) -> "RuntimeStageContract":
         self.depends_on = _bounded_unique(
             self.depends_on,
             MAX_DEPENDENCIES,
@@ -991,6 +1077,7 @@ class RuntimeSessionContract(RuntimeContract):
     )
 
     def touch(self) -> None:
+        """Update the session modification timestamp."""
         self.updated_at = utc_now()
 
 
@@ -1093,11 +1180,14 @@ class RuntimeSnapshotContract(RuntimeContract):
     )
 
     @model_validator(mode="after")
-    def ensure_checksum(self) -> "RuntimeSnapshotContract":
+    def ensure_checksum(
+        self,
+    ) -> "RuntimeSnapshotContract":
         if not self.checksum:
-            canonical = self.world_state.model_dump_json(
-                sort_keys=True
+            canonical = _canonical_model_json(
+                self.world_state
             )
+
             self.checksum = content_sha256(
                 canonical
             )
@@ -1125,7 +1215,9 @@ class RuntimePatchContract(RuntimeContract):
         ge=0
     )
 
-    operations: List[Dict[str, Any]] = Field(
+    operations: List[
+        Dict[str, Any]
+    ] = Field(
         default_factory=list
     )
 
@@ -1140,7 +1232,9 @@ class RuntimePatchContract(RuntimeContract):
     )
 
     @model_validator(mode="after")
-    def validate_versions(self) -> "RuntimePatchContract":
+    def validate_versions(
+        self,
+    ) -> "RuntimePatchContract":
         if (
             self.target_state_version
             < self.base_state_version
@@ -1187,7 +1281,9 @@ class RuntimePipelineRequest(RuntimeContract):
     )
 
     @model_validator(mode="after")
-    def validate_pipeline(self) -> "RuntimePipelineRequest":
+    def validate_pipeline(
+        self,
+    ) -> "RuntimePipelineRequest":
         if len(self.stages) > MAX_BATCH_SIZE:
             raise ValueError(
                 "RuntimePipelineRequest contains too many stages."
@@ -1207,8 +1303,8 @@ class RuntimePipelineRequest(RuntimeContract):
 
             if missing:
                 raise ValueError(
-                    f"Stage '{stage.stage_id}' has missing dependencies: "
-                    f"{missing}"
+                    f"Stage '{stage.stage_id}' has missing "
+                    f"dependencies: {missing}"
                 )
 
         return self
@@ -1259,12 +1355,24 @@ def runtime_json(
     value: RuntimeContract,
 ) -> str:
     """
-    Canonical JSON representation for hashing, transport and persistence.
+    Return deterministic canonical JSON.
+
+    Important:
+    This uses Python's JSON serializer with sort_keys=True rather than
+    passing unsupported arguments to Pydantic's model_dump_json().
     """
-    return value.model_dump_json(
+    payload = value.model_dump(
+        mode="json",
         by_alias=True,
         exclude_none=False,
         round_trip=True,
+    )
+
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
     )
 
 
@@ -1272,7 +1380,7 @@ def runtime_dict(
     value: RuntimeContract,
 ) -> Dict[str, Any]:
     """
-    Safe dictionary representation for internal adapters.
+    Return a JSON-safe dictionary representation for internal adapters.
     """
     return value.model_dump(
         mode="json",
@@ -1284,6 +1392,9 @@ def runtime_dict(
 def runtime_checksum(
     value: RuntimeContract,
 ) -> str:
+    """
+    Return SHA-256 of the canonical runtime contract JSON.
+    """
     return content_sha256(
         runtime_json(value)
     )
