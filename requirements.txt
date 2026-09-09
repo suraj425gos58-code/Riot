@@ -1,23 +1,47 @@
-Core Server (Render Optimized)
-fastapi==0.104.1
-uvicorn[standard]==0.24.0.post1
-pydantic==2.5.2
-pydantic-settings==2.1.0
-Async WebSockets (Live Editing & Sync)
-websockets==12.0
-aiohttp==3.9.1
-python-socketio==5.10.0
-File Handling (ZIP Compiler)
-aiofiles==23.2.1
-zipfile36==0.1.3
-AI & APIs (The Swarm)
-google-generativeai==0.3.1
-openai==1.3.7
-Security & Secrets
-cryptography==41.0.7
-python-dotenv==1.0.0
-PyJWT==2.8.0
-Mathematics for AI (ODRE Matrix)
-numpy==1.26.2
-Code Formatting (AST System)
-black==23.11.0
+# Riot / God Node — Full Production Dependency Profile
+#
+# Full installation:
+#   python -m pip install -r requirements.txt
+#
+# Minimal installation:
+#   python -m pip install -r requirements/base.txt
+#
+# Add feature packs only when their capabilities are deployed.
+
+-r requirements/base.txt
+-r requirements/ai.txt
+-r requirements/storage.txt
+-r requirements/realtime.txt
+-r requirements/dev.txt
+# Core HTTP/API runtime
+fastapi>=0.104,<1
+uvicorn[standard]>=0.24,<1
+pydantic>=2.5,<3
+pydantic-settings>=2.1,<3
+
+# Async networking / connection management
+aiohttp>=3.9,<4
+aiofiles>=23.2,<25
+
+# Security / configuration
+cryptography>=41,<46
+python-dotenv>=1,<2
+PyJWT>=2.8,<3
+
+# Numerical/runtime support
+numpy>=1.26,<3
+# Provider SDKs are feature dependencies.
+# Provider availability is detected at runtime.
+
+google-generativeai>=0.3,<1
+openai>=1.3,<2
+# Cloud object storage
+boto3>=1.35,<2
+# WebSocket / realtime editing / multiplayer transport
+
+websockets>=12,<16
+python-socketio>=5.10,<6
+# Development / validation / self-evolution tooling
+
+black>=23.11,<26
+PyGithub>=2,<3
